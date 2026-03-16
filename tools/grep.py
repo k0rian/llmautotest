@@ -1,95 +1,11 @@
 import asyncio
-import os
 import re
 from pathlib import Path
-from typing import Dict, List, Optional, Any, Tuple
+from typing import Dict, List, Optional, Any
 from pydantic import BaseModel, Field, field_validator
 from langchain.tools import tool
 from file.ripgrep import Ripgrep
-
-# ======================== 1. 模拟原TS中的核心依赖（对应opencode的util/process、project/instance等） ========================
-class Instance:
-    """模拟项目实例：对应 opencode 的 ../project/instance"""
-    # Agent 中可替换为真实的工作目录（如从配置/上下文读取）
-    directory: Path = Path.cwd()
-
-class Filesystem:
-    """模拟文件系统工具：对应 opencode 的 ../util/filesystem"""
-    @staticmethod
-    def stat(file_path: str | Path) -> Optional[os.stat_result]:
-        """获取文件状态，兼容不存在的路径"""
-        try:
-            return os.stat(file_path)
-        except OSError:
-            return None
-
-async def assert_external_directory(ctx: Any, search_path: str | Path, opts: Dict = None):
-    """模拟外部目录校验：对应 opencode 的 ./external-directory"""
-    # Agent 中可扩展：校验路径是否在允许的范围（防止越权访问）
-    allowed_dirs = [Instance.directory]
-    path_obj = Path(search_path).resolve()
-    if not any(path_obj.is_relative_to(allowed) for allowed in allowed_dirs):
-        raise PermissionError(f"Path {search_path} is outside allowed directories")
-
-# ======================== 3. 进程管理封装（对应 util/process.ts） ========================
-class ProcessResult:
-    """进程执行结果封装"""
-    def __init__(self, stdout: str, stderr: str, exit_code: int):
-        self.stdout = stdout
-        self.stderr = stderr
-        self.exit_code = exit_code
-
-class Process:
-    """异步进程管理：模拟 opencode 的 Process 类"""
-    @staticmethod
-    async def spawn(
-        cmd: List[str],
-        opts: Dict = None  # 支持 stdout/sterr/abort 配置
-    ) -> Tuple[asyncio.subprocess.Process, asyncio.Future[int]]:
-        """
-        启动异步进程，返回进程对象 + 退出码Future
-        :param cmd: 命令列表（如 [rg_path, "-nH", "--hidden"]）
-        :param opts: 配置项：stdout/sterr（"pipe"）、abort（取消信号）
-        :return: (进程对象, 退出码Future)
-        """
-        opts = opts or {}
-        stdout = asyncio.subprocess.PIPE if opts.get("stdout") == "pipe" else None
-        stderr = asyncio.subprocess.PIPE if opts.get("stderr") == "pipe" else None
-        
-        # 启动进程
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=stdout,
-            stderr=stderr,
-            cwd=Instance.directory,
-            env=os.environ.copy()
-        )
-
-        # 处理abort信号（Agent 中断时终止进程）
-        abort_event = opts.get("abort")
-        if abort_event and isinstance(abort_event, asyncio.Event):
-            async def watch_abort():
-                await abort_event.wait()
-                proc.terminate()
-            asyncio.create_task(watch_abort())
-
-        # 封装退出码Future
-        async def wait_exit():
-            return await proc.wait()
-        exit_future = asyncio.ensure_future(wait_exit())
-
-        return proc, exit_future
-
-    @staticmethod
-    async def read_stream(stream: asyncio.StreamReader) -> str:
-        """读取进程输出流（兼容空流）"""
-        if not stream:
-            return ""
-        try:
-            data = await stream.read()
-            return data.decode("utf-8", errors="replace").strip()
-        except Exception:
-            return ""
+from tools.core import AsyncProcess, Filesystem, ProjectContext, WorkspaceGuard
 
 # ======================== 4. Agent 集成的 GrepTool 核心类 ========================
 class GrepToolParams(BaseModel):
@@ -130,15 +46,16 @@ Exit codes: 0 = matches found, 1 = no matches, 2 = partial errors (e.g. inaccess
 
         # 2. 路径处理：相对路径转绝对路径，校验合法性
         search_path = cls._resolve_search_path(params.path)
-        await assert_external_directory(ctx, search_path, {"kind": "directory"})
+        WorkspaceGuard.ensure_under_workspace(ProjectContext.directory, search_path)
 
         # 3. 构造 rg 命令参数
         rg_path = await Ripgrep.filepath()
         rg_args = cls._build_rg_args(params, search_path)
 
         # 4. 执行 rg 进程
-        proc, exit_future = await Process.spawn(
+        proc, exit_future = await AsyncProcess.spawn(
             [rg_path] + rg_args,
+            cwd=ProjectContext.directory,
             opts={
                 "stdout": "pipe",
                 "stderr": "pipe",
@@ -147,8 +64,8 @@ Exit codes: 0 = matches found, 1 = no matches, 2 = partial errors (e.g. inaccess
         )
 
         # 5. 读取输出和退出码
-        stdout = await Process.read_stream(proc.stdout)
-        stderr = await Process.read_stream(proc.stderr)
+        stdout = await AsyncProcess.read_stream(proc.stdout)
+        stderr = await AsyncProcess.read_stream(proc.stderr)
         exit_code = await exit_future
 
         # 6. 退出码处理（对齐 grep.ts 逻辑）
@@ -180,11 +97,7 @@ Exit codes: 0 = matches found, 1 = no matches, 2 = partial errors (e.g. inaccess
     @classmethod
     def _resolve_search_path(cls, path: Optional[str]) -> Path:
         """解析搜索路径：默认项目根目录，相对路径转绝对路径"""
-        search_path = path or Instance.directory
-        path_obj = Path(search_path)
-        if not path_obj.is_absolute():
-            path_obj = Instance.directory / path_obj
-        return path_obj.resolve()
+        return ProjectContext.resolve_path(path)
 
     @classmethod
     def _build_rg_args(cls, params: GrepToolParams, search_path: Path) -> List[str]:
