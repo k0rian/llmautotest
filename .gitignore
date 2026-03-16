@@ -4,3 +4,4 @@ __pycache__/
 *.json
 *test.py
 *.yml
+*.bin
