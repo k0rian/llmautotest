@@ -1,6 +1,7 @@
 import json
 import os
 import shlex
+import shutil
 import subprocess
 import threading
 from pathlib import Path
@@ -12,11 +13,35 @@ def _to_uri(file_path: str) -> str:
     return Path(os.path.abspath(file_path)).as_uri()
 
 
+def _normalize_command(command: str | list[str]) -> tuple[str, list[str]]:
+    if isinstance(command, list):
+        parts = [str(item).strip() for item in command if str(item).strip()]
+    else:
+        parts = shlex.split(str(command), posix=False)
+    if not parts:
+        raise ValueError("command cannot be empty")
+    executable = parts[0]
+    resolved = shutil.which(executable)
+    if resolved:
+        parts[0] = resolved
+    display = " ".join(parts)
+    return display, parts
+
+
 class LSPSession:
-    def __init__(self, session_id: str, command: str, workspace_path: str):
+    def __init__(
+        self,
+        session_id: str,
+        command: str | list[str],
+        workspace_path: str,
+        env: dict[str, str] | None = None,
+    ):
         self.session_id = session_id
-        self.command = command
+        command_text, command_parts = _normalize_command(command)
+        self.command = command_text
+        self.command_parts = command_parts
         self.workspace_path = os.path.abspath(workspace_path)
+        self.env = dict(env) if isinstance(env, dict) else {}
         self.process: subprocess.Popen | None = None
         self._write_lock = threading.Lock()
         self._state_lock = threading.Lock()
@@ -35,15 +60,22 @@ class LSPSession:
     def start(self) -> None:
         if self._running:
             return
-        cmd_parts = shlex.split(self.command, posix=False)
-        self.process = subprocess.Popen(
-            cmd_parts,
-            cwd=self.workspace_path,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            bufsize=0,
-        )
+        process_env = os.environ.copy()
+        process_env.update(self.env)
+        try:
+            self.process = subprocess.Popen(
+                self.command_parts,
+                cwd=self.workspace_path,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                bufsize=0,
+                env=process_env,
+            )
+        except FileNotFoundError as exc:
+            raise RuntimeError(f"LSP command not found: {self.command}") from exc
+        except OSError as exc:
+            raise RuntimeError(f"failed to start LSP process: {self.command}") from exc
         self._running = True
         self._stdout_thread = threading.Thread(target=self._stdout_loop, daemon=True)
         self._stderr_thread = threading.Thread(target=self._stderr_loop, daemon=True)

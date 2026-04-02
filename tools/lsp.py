@@ -1,4 +1,9 @@
 import json
+import os
+from pathlib import Path
+import shlex
+import shutil
+import subprocess
 import time
 from typing import Any
 from langchain.tools import tool
@@ -10,6 +15,7 @@ from services.lsp.manager import (
     stop_session,
     to_uri,
 )
+from services.lsp.server import LSPServer
 
 
 def _json_dump(payload: Any) -> str:
@@ -25,6 +31,89 @@ def _parse_json(value: str, fallback: Any) -> Any:
         return fallback
 
 
+_COMMAND_INSTALLERS: dict[str, list[list[str]]] = {
+    "pylsp": [["py", "-3", "-m", "pip", "install", "python-lsp-server"], ["pip", "install", "python-lsp-server"]],
+    "pyright-langserver": [["npm", "install", "-g", "pyright"]],
+    "typescript-language-server": [["npm", "install", "-g", "typescript", "typescript-language-server"]],
+    "yaml-language-server": [["npm", "install", "-g", "yaml-language-server"]],
+    "gopls": [["go", "install", "golang.org/x/tools/gopls@latest"]],
+}
+
+
+def _detect_workspace_path(file_path: str) -> str:
+    absolute = Path(os.path.abspath(file_path))
+    current = absolute.parent
+    for parent in [current, *list(current.parents)]:
+        if (parent / ".git").exists() or (parent / "config.yml").exists() or (parent / "config.yaml").exists():
+            return str(parent)
+    return str(current)
+
+
+def _ensure_lsp_command_available(command: str | list[str], workspace_path: str) -> None:
+    parts = [str(item).strip() for item in command] if isinstance(command, list) else shlex.split(str(command), posix=False)
+    parts = [item for item in parts if item]
+    if not parts:
+        raise ValueError("LSP command cannot be empty")
+    executable = parts[0]
+    if shutil.which(executable):
+        return
+    installers = _COMMAND_INSTALLERS.get(executable, [])
+    if not installers:
+        return
+    for install_command in installers:
+        installer = install_command[0] if install_command else ""
+        if not installer or shutil.which(installer) is None:
+            continue
+        try:
+            done = subprocess.run(
+                install_command,
+                cwd=workspace_path,
+                capture_output=True,
+                text=True,
+                timeout=300,
+                shell=False,
+            )
+        except Exception:
+            continue
+        if done.returncode == 0 and shutil.which(executable):
+            return
+
+
+def _resolve_session(session_id: str, trace: str = "off"):
+    sess = get_session(session_id)
+    if sess.is_alive():
+        return sess
+    _ensure_lsp_command_available(sess.command, sess.workspace_path)
+    start_session(
+        session_id=session_id,
+        command=sess.command,
+        workspace_path=sess.workspace_path,
+        trace=trace,
+    )
+    return get_session(session_id)
+
+
+def _resolve_session_and_file(session_id: str, file_path: str, trace: str = "off"):
+    absolute = os.path.abspath(file_path)
+    try:
+        sess = _resolve_session(session_id=session_id, trace=trace)
+    except Exception:
+        workspace_path = _detect_workspace_path(absolute)
+        server = LSPServer(workspace_path=workspace_path)
+        profile = server.profile_for_file(absolute)
+        start_session(
+            session_id=session_id,
+            command=profile.command,
+            workspace_path=workspace_path,
+            initialization_options=profile.initialization,
+            env=profile.env,
+            trace=trace,
+        )
+        sess = get_session(session_id)
+    checked = ensure_workspace_file(sess, absolute)
+    return sess, checked
+
+
 @tool
 def lsp_start_session(
     session_id: str,
@@ -38,6 +127,9 @@ def lsp_start_session(
     """
     try:
         init_options = _parse_json(initialization_options_json, {})
+        if not isinstance(init_options, dict):
+            init_options = {}
+        _ensure_lsp_command_available(command, workspace_path)
         result = start_session(
             session_id=session_id,
             command=command,
@@ -79,8 +171,7 @@ def lsp_open_document(session_id: str, file_path: str, language_id: str = "") ->
     将文件同步给 LSP，开始跟踪该文档版本与诊断。
     """
     try:
-        sess = get_session(session_id)
-        absolute = ensure_workspace_file(sess, file_path)
+        sess, absolute = _resolve_session_and_file(session_id=session_id, file_path=file_path)
         result = sess.did_open(file_path=absolute, language_id=language_id)
         return _json_dump({"session_id": session_id, "status": "opened", **result})
     except Exception as e:
@@ -93,8 +184,7 @@ def lsp_change_document(session_id: str, file_path: str, new_text: str) -> str:
     发送全文变更到 LSP，触发增量分析与诊断更新。
     """
     try:
-        sess = get_session(session_id)
-        absolute = ensure_workspace_file(sess, file_path)
+        sess, absolute = _resolve_session_and_file(session_id=session_id, file_path=file_path)
         result = sess.did_change(file_path=absolute, text=new_text)
         return _json_dump({"session_id": session_id, "status": "changed", **result})
     except Exception as e:
@@ -107,8 +197,7 @@ def lsp_close_document(session_id: str, file_path: str) -> str:
     通知 LSP 文档关闭。
     """
     try:
-        sess = get_session(session_id)
-        absolute = ensure_workspace_file(sess, file_path)
+        sess, absolute = _resolve_session_and_file(session_id=session_id, file_path=file_path)
         result = sess.did_close(file_path=absolute)
         return _json_dump({"session_id": session_id, "status": "closed", **result})
     except Exception as e:
@@ -121,8 +210,7 @@ def lsp_save_document(session_id: str, file_path: str, include_text: bool = Fals
     通知 LSP 文档已保存，触发保存后诊断。
     """
     try:
-        sess = get_session(session_id)
-        absolute = ensure_workspace_file(sess, file_path)
+        sess, absolute = _resolve_session_and_file(session_id=session_id, file_path=file_path)
         text = ""
         if include_text:
             with open(absolute, "r", encoding="utf-8", errors="ignore") as f:
@@ -139,8 +227,7 @@ def lsp_hover(session_id: str, file_path: str, line: int, character: int) -> str
     查询指定位置的悬浮信息。
     """
     try:
-        sess = get_session(session_id)
-        absolute = ensure_workspace_file(sess, file_path)
+        sess, absolute = _resolve_session_and_file(session_id=session_id, file_path=file_path)
         result = sess.request(
             "textDocument/hover",
             {
@@ -159,8 +246,7 @@ def lsp_definition(session_id: str, file_path: str, line: int, character: int) -
     查询定义跳转位置。
     """
     try:
-        sess = get_session(session_id)
-        absolute = ensure_workspace_file(sess, file_path)
+        sess, absolute = _resolve_session_and_file(session_id=session_id, file_path=file_path)
         result = sess.request(
             "textDocument/definition",
             {
@@ -185,8 +271,7 @@ def lsp_references(
     查询引用位置列表。
     """
     try:
-        sess = get_session(session_id)
-        absolute = ensure_workspace_file(sess, file_path)
+        sess, absolute = _resolve_session_and_file(session_id=session_id, file_path=file_path)
         result = sess.request(
             "textDocument/references",
             {
@@ -206,8 +291,7 @@ def lsp_document_symbols(session_id: str, file_path: str) -> str:
     获取文档符号树。
     """
     try:
-        sess = get_session(session_id)
-        absolute = ensure_workspace_file(sess, file_path)
+        sess, absolute = _resolve_session_and_file(session_id=session_id, file_path=file_path)
         result = sess.request(
             "textDocument/documentSymbol",
             {"textDocument": {"uri": to_uri(absolute)}},
@@ -223,7 +307,7 @@ def lsp_workspace_symbols(session_id: str, query: str) -> str:
     按关键字搜索工作区符号。
     """
     try:
-        sess = get_session(session_id)
+        sess = _resolve_session(session_id=session_id)
         result = sess.request("workspace/symbol", {"query": query})
         return _json_dump({"session_id": session_id, "result": result})
     except Exception as e:
@@ -242,8 +326,7 @@ def lsp_rename(
     触发符号重命名并返回 WorkspaceEdit。
     """
     try:
-        sess = get_session(session_id)
-        absolute = ensure_workspace_file(sess, file_path)
+        sess, absolute = _resolve_session_and_file(session_id=session_id, file_path=file_path)
         result = sess.request(
             "textDocument/rename",
             {
@@ -271,9 +354,10 @@ def lsp_code_actions(
     获取某个范围可执行的 Code Action。
     """
     try:
-        sess = get_session(session_id)
-        absolute = ensure_workspace_file(sess, file_path)
+        sess, absolute = _resolve_session_and_file(session_id=session_id, file_path=file_path)
         diagnostics = _parse_json(diagnostics_json, [])
+        if not isinstance(diagnostics, list):
+            diagnostics = []
         result = sess.request(
             "textDocument/codeAction",
             {
@@ -301,8 +385,7 @@ def lsp_format_document(
     请求文档格式化并返回 TextEdit 列表。
     """
     try:
-        sess = get_session(session_id)
-        absolute = ensure_workspace_file(sess, file_path)
+        sess, absolute = _resolve_session_and_file(session_id=session_id, file_path=file_path)
         result = sess.request(
             "textDocument/formatting",
             {
@@ -327,8 +410,7 @@ def lsp_completion(
     获取指定位置的自动补全候选。
     """
     try:
-        sess = get_session(session_id)
-        absolute = ensure_workspace_file(sess, file_path)
+        sess, absolute = _resolve_session_and_file(session_id=session_id, file_path=file_path)
         context = {"triggerKind": 1}
         if trigger_character:
             context = {"triggerKind": 2, "triggerCharacter": trigger_character}
@@ -353,10 +435,8 @@ def lsp_raw_request(session_id: str, method: str, params_json: str = "{}", timeo
     try:
         if not method.strip():
             return "LSP error: method cannot be empty"
-        sess = get_session(session_id)
+        sess = _resolve_session(session_id=session_id)
         params = _parse_json(params_json, {})
-        if not isinstance(params, dict):
-            return "LSP error: params_json must be a JSON object"
         result = sess.request(method.strip(), params, timeout_seconds=max(1, min(int(timeout_seconds), 120)))
         return _json_dump({"session_id": session_id, "method": method.strip(), "result": result})
     except Exception as e:
@@ -369,7 +449,7 @@ def lsp_get_diagnostics(session_id: str, file_path: str = "") -> str:
     获取缓存的诊断信息，可按文件过滤。
     """
     try:
-        sess = get_session(session_id)
+        sess = _resolve_session(session_id=session_id)
         absolute = ""
         if file_path and file_path.strip():
             absolute = ensure_workspace_file(sess, file_path)
@@ -385,8 +465,7 @@ def lsp_wait_for_diagnostics(session_id: str, file_path: str, timeout_seconds: f
     等待某文件诊断更新或超时返回。
     """
     try:
-        sess = get_session(session_id)
-        absolute = ensure_workspace_file(sess, file_path)
+        sess, absolute = _resolve_session_and_file(session_id=session_id, file_path=file_path)
         baseline = sess.diagnostics_version()
         timeout = max(0.1, min(float(timeout_seconds), 30.0))
         deadline = time.time() + timeout
@@ -415,7 +494,7 @@ def lsp_get_notifications(session_id: str, limit: int = 20) -> str:
     获取最近通知，便于 LangGraph 在步骤间追踪上下文。
     """
     try:
-        sess = get_session(session_id)
+        sess = _resolve_session(session_id=session_id)
         result = sess.notifications(limit=max(1, min(int(limit), 100)))
         return _json_dump({"session_id": session_id, "notifications": result})
     except Exception as e:
@@ -428,7 +507,7 @@ def lsp_get_server_logs(session_id: str, limit: int = 50) -> str:
     获取最近的 LSP stderr 输出，便于故障排查。
     """
     try:
-        sess = get_session(session_id)
+        sess = _resolve_session(session_id=session_id)
         logs = sess.stderr_output(limit=max(1, min(int(limit), 200)))
         return _json_dump({"session_id": session_id, "stderr": logs})
     except Exception as e:
@@ -441,7 +520,7 @@ def lsp_get_session_info(session_id: str) -> str:
     查看会话状态、初始化结果与诊断版本。
     """
     try:
-        sess = get_session(session_id)
+        sess = _resolve_session(session_id=session_id)
         return _json_dump(
             {
                 "session_id": session_id,

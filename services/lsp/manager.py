@@ -33,15 +33,22 @@ def ensure_workspace_file(sess: LSPSession, file_path: str) -> str:
 
 def start_session(
     session_id: str,
-    command: str,
+    command: str | list[str],
     workspace_path: str,
     initialization_options: dict[str, Any] | None = None,
+    env: dict[str, str] | None = None,
     trace: str = "off",
 ) -> dict[str, Any]:
     key = session_id.strip()
     if not key:
         raise ValueError("session_id cannot be empty")
-    if not command.strip():
+    if isinstance(command, list):
+        command_parts = [str(item).strip() for item in command if str(item).strip()]
+        command_payload: str | list[str] = command_parts
+    else:
+        command_parts = [str(command).strip()]
+        command_payload = str(command).strip()
+    if not command_parts:
         raise ValueError("command cannot be empty")
     if not os.path.isdir(workspace_path):
         raise ValueError(f"invalid workspace path '{workspace_path}'")
@@ -53,7 +60,8 @@ def start_session(
                 _SESSIONS[key].stop()
             except Exception:
                 pass
-        sess = LSPSession(key, command, workspace_path)
+        session_env = env if isinstance(env, dict) else {}
+        sess = LSPSession(key, command_payload, workspace_path, env=session_env)
         _SESSIONS[key] = sess
     sess.start()
     init_options = initialization_options if isinstance(initialization_options, dict) else {}
