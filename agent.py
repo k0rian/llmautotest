@@ -5,6 +5,7 @@ from typing import Any, TypedDict
 import traceback
 import logging
 from llm_utils.config_loader import load_api_key
+from router.router import build_system_prompt
 import sys
 import os
 import asyncio
@@ -134,14 +135,11 @@ def _strip_frontmatter(raw: str) -> str:
     return parts[2].strip()
 
 
-def load_static_audit_prompt() -> str:
-    if not PROMPT_FILE.exists():
-        LOGGER.error("Prompt 文件不存在: %s", PROMPT_FILE)
-        raise RuntimeError(f"Prompt 文件不存在: {PROMPT_FILE}")
-    prompt_text = _strip_frontmatter(PROMPT_FILE.read_text(encoding="utf-8")).strip()
+def load_static_audit_prompt(workspace_path: str) -> str:
+    prompt_text = build_system_prompt(workspace_path=workspace_path, base_prompt_file=PROMPT_FILE)
     if not prompt_text:
-        LOGGER.error("Prompt 文件为空: %s", PROMPT_FILE)
-        raise RuntimeError(f"Prompt 文件为空: {PROMPT_FILE}")
+        LOGGER.error("Prompt 文件为空或技能路由失败: %s", PROMPT_FILE)
+        raise RuntimeError(f"Prompt 文件为空或技能路由失败: {PROMPT_FILE}")
     return prompt_text
 
 
@@ -270,7 +268,7 @@ async def _run_audit_cli_async(
     payload = {
         "user_request": user_request.strip() or DEFAULT_AUDIT_REQUEST,
         "workspace_path": str(Path(workspace_path).resolve()),
-        "skill_prompt": load_static_audit_prompt(),
+        "skill_prompt": load_static_audit_prompt(workspace_path),
     }
     await stream_handler.start()
     result: dict[str, Any] = {}
