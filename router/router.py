@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Iterable
+from services.lsp.server import LSPServer
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -24,19 +25,31 @@ class SkillRule:
     key: str
     skill_file: str
     extensions: tuple[str, ...] = ()
+    lsp_server: str = ""
+    probe_extension: str = ""
 
 
 DEFAULT_RULES: tuple[SkillRule, ...] = (
-    SkillRule(key="python", skill_file="PY_SKILL.md", extensions=(".py", ".pyi")),
+    SkillRule(
+        key="python",
+        skill_file="PY_SKILL.md",
+        extensions=(".py", ".pyi"),
+        lsp_server="python",
+        probe_extension=".py",
+    ),
     SkillRule(
         key="javascript",
         skill_file="JS_SKILL.md",
         extensions=(".js", ".jsx", ".mjs", ".cjs"),
+        lsp_server="typescript",
+        probe_extension=".js",
     ),
     SkillRule(
         key="typescript",
         skill_file="JS_SKILL.md",
         extensions=(".ts", ".tsx", ".mts", ".cts"),
+        lsp_server="typescript",
+        probe_extension=".ts",
     ),
 )
 
@@ -145,6 +158,86 @@ def build_system_prompt(
     return "\n\n".join(part for part in sections if part).strip()
 
 
+def validate_workspace_lsp(
+    workspace_path: str | Path,
+    rules: Iterable[SkillRule] = DEFAULT_RULES,
+) -> dict[str, Any]:
+    workspace = Path(workspace_path).resolve()
+    rule_list = list(rules)
+    scores = detect_languages(workspace_path=workspace, rules=rule_list)
+    server = LSPServer(workspace_path=str(workspace))
+    checks: list[dict[str, Any]] = []
+    seen_servers: set[str] = set()
+    for rule in rule_list:
+        if scores.get(rule.key, 0) <= 0:
+            continue
+        profile = rule.lsp_server.strip()
+        suffix = rule.probe_extension.strip()
+        if not profile or not suffix:
+            checks.append(
+                {
+                    "language": rule.key,
+                    "server": "",
+                    "status": "skipped",
+                    "reason": "no_lsp_mapping",
+                }
+            )
+            continue
+        if profile in seen_servers:
+            checks.append(
+                {
+                    "language": rule.key,
+                    "server": profile,
+                    "status": "ok",
+                    "reason": "checked_by_shared_server",
+                }
+            )
+            continue
+        probe_path = str(workspace / f".skill_probe{suffix}")
+        try:
+            server.profile_for_file(probe_path, preferred_server=profile)
+            checks.append({"language": rule.key, "server": profile, "status": "ok"})
+            seen_servers.add(profile)
+        except Exception as exc:
+            checks.append(
+                {
+                    "language": rule.key,
+                    "server": profile,
+                    "status": "failed",
+                    "reason": str(exc),
+                }
+            )
+    errors = [item for item in checks if item.get("status") == "failed"]
+    return {
+        "ready": len(errors) == 0,
+        "checks": checks,
+        "errors": errors,
+    }
+
+
+def build_perception_result(
+    workspace_path: str | Path,
+    base_prompt_file: str | Path = DEFAULT_PROMPT_FILE,
+    skill_dir: str | Path = DEFAULT_SKILL_DIR,
+    rules: Iterable[SkillRule] = DEFAULT_RULES,
+) -> dict[str, Any]:
+    snapshot = build_router_snapshot(workspace_path=workspace_path, skill_dir=skill_dir, rules=rules)
+    lsp_validation = validate_workspace_lsp(workspace_path=workspace_path, rules=rules)
+    prompt = build_system_prompt(
+        workspace_path=workspace_path,
+        base_prompt_file=base_prompt_file,
+        skill_dir=skill_dir,
+        rules=rules,
+    )
+    return {
+        "workspace_path": str(Path(workspace_path).resolve()),
+        "language_scores": snapshot["language_scores"],
+        "skill_files": snapshot["skill_files"],
+        "lsp_validation": lsp_validation,
+        "system_prompt": prompt,
+    }
+
+
 def build_router_snapshot(
     workspace_path: str | Path,
     skill_dir: str | Path = DEFAULT_SKILL_DIR,
@@ -166,5 +259,7 @@ __all__ = [
     "detect_languages",
     "route_skill_files",
     "build_system_prompt",
+    "validate_workspace_lsp",
+    "build_perception_result",
     "build_router_snapshot",
 ]

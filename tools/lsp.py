@@ -1,9 +1,5 @@
 import json
 import os
-from pathlib import Path
-import shlex
-import shutil
-import subprocess
 import time
 from typing import Any
 from langchain.tools import tool
@@ -15,7 +11,6 @@ from services.lsp.manager import (
     stop_session,
     to_uri,
 )
-from services.lsp.server import LSPServer
 
 
 def _json_dump(payload: Any) -> str:
@@ -31,59 +26,10 @@ def _parse_json(value: str, fallback: Any) -> Any:
         return fallback
 
 
-_COMMAND_INSTALLERS: dict[str, list[list[str]]] = {
-    "pylsp": [["py", "-3", "-m", "pip", "install", "python-lsp-server"], ["pip", "install", "python-lsp-server"]],
-    "pyright-langserver": [["npm", "install", "-g", "pyright"]],
-    "typescript-language-server": [["npm", "install", "-g", "typescript", "typescript-language-server"]],
-    "yaml-language-server": [["npm", "install", "-g", "yaml-language-server"]],
-    "gopls": [["go", "install", "golang.org/x/tools/gopls@latest"]],
-}
-
-
-def _detect_workspace_path(file_path: str) -> str:
-    absolute = Path(os.path.abspath(file_path))
-    current = absolute.parent
-    for parent in [current, *list(current.parents)]:
-        if (parent / ".git").exists() or (parent / "config.yml").exists() or (parent / "config.yaml").exists():
-            return str(parent)
-    return str(current)
-
-
-def _ensure_lsp_command_available(command: str | list[str], workspace_path: str) -> None:
-    parts = [str(item).strip() for item in command] if isinstance(command, list) else shlex.split(str(command), posix=False)
-    parts = [item for item in parts if item]
-    if not parts:
-        raise ValueError("LSP command cannot be empty")
-    executable = parts[0]
-    if shutil.which(executable):
-        return
-    installers = _COMMAND_INSTALLERS.get(executable, [])
-    if not installers:
-        return
-    for install_command in installers:
-        installer = install_command[0] if install_command else ""
-        if not installer or shutil.which(installer) is None:
-            continue
-        try:
-            done = subprocess.run(
-                install_command,
-                cwd=workspace_path,
-                capture_output=True,
-                text=True,
-                timeout=300,
-                shell=False,
-            )
-        except Exception:
-            continue
-        if done.returncode == 0 and shutil.which(executable):
-            return
-
-
 def _resolve_session(session_id: str, trace: str = "off"):
     sess = get_session(session_id)
     if sess.is_alive():
         return sess
-    _ensure_lsp_command_available(sess.command, sess.workspace_path)
     start_session(
         session_id=session_id,
         command=sess.command,
@@ -95,21 +41,7 @@ def _resolve_session(session_id: str, trace: str = "off"):
 
 def _resolve_session_and_file(session_id: str, file_path: str, trace: str = "off"):
     absolute = os.path.abspath(file_path)
-    try:
-        sess = _resolve_session(session_id=session_id, trace=trace)
-    except Exception:
-        workspace_path = _detect_workspace_path(absolute)
-        server = LSPServer(workspace_path=workspace_path)
-        profile = server.profile_for_file(absolute)
-        start_session(
-            session_id=session_id,
-            command=profile.command,
-            workspace_path=workspace_path,
-            initialization_options=profile.initialization,
-            env=profile.env,
-            trace=trace,
-        )
-        sess = get_session(session_id)
+    sess = _resolve_session(session_id=session_id, trace=trace)
     checked = ensure_workspace_file(sess, absolute)
     return sess, checked
 
@@ -129,7 +61,6 @@ def lsp_start_session(
         init_options = _parse_json(initialization_options_json, {})
         if not isinstance(init_options, dict):
             init_options = {}
-        _ensure_lsp_command_available(command, workspace_path)
         result = start_session(
             session_id=session_id,
             command=command,

@@ -5,7 +5,7 @@ from typing import Any, TypedDict
 import traceback
 import logging
 from llm_utils.config_loader import load_api_key
-from router.router import build_system_prompt
+from router.router import build_perception_result
 import sys
 import os
 import asyncio
@@ -36,6 +36,9 @@ class AuditState(TypedDict, total=False):
     user_request: str
     workspace_path: str
     skill_prompt: str
+    perception_summary: str
+    lsp_ready: bool
+    lsp_error: str
     plan: str
     planner_summary: str
     audit_output: str
@@ -125,18 +128,10 @@ def _read_text(value: Any) -> str:
     return str(value)
 
 
-def _strip_frontmatter(raw: str) -> str:
-    text = raw.strip()
-    if not text.startswith("---"):
-        return text
-    parts = text.split("---", 2)
-    if len(parts) < 3:
-        return text
-    return parts[2].strip()
-
 
 def load_static_audit_prompt(workspace_path: str) -> str:
-    prompt_text = build_system_prompt(workspace_path=workspace_path, base_prompt_file=PROMPT_FILE)
+    perception = build_perception_result(workspace_path=workspace_path, base_prompt_file=PROMPT_FILE)
+    prompt_text = str(perception.get("system_prompt", "")).strip()
     if not prompt_text:
         LOGGER.error("Prompt 文件为空或技能路由失败: %s", PROMPT_FILE)
         raise RuntimeError(f"Prompt 文件为空或技能路由失败: {PROMPT_FILE}")
@@ -190,8 +185,65 @@ def _format_steps(steps: list[dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
+def perception_node(state: AuditState) -> AuditState:
+    workspace_path = state.get("workspace_path", "").strip()
+    if not workspace_path:
+        return {
+            "lsp_ready": False,
+            "lsp_error": "工作区路径为空，无法执行感知阶段",
+            "perception_summary": "感知失败：缺少工作区路径",
+            "audit_output": "感知阶段失败：工作区路径为空，无法校验技能与 LSP 服务",
+        }
+    try:
+        perception = build_perception_result(workspace_path=workspace_path, base_prompt_file=PROMPT_FILE)
+    except Exception as exc:
+        return {
+            "lsp_ready": False,
+            "lsp_error": str(exc),
+            "perception_summary": f"感知阶段异常：{str(exc)}",
+            "audit_output": f"感知阶段失败：{str(exc)}",
+        }
+    prompt_text = str(perception.get("system_prompt", "")).strip()
+    validation = perception.get("lsp_validation", {})
+    checks = validation.get("checks", []) if isinstance(validation, dict) else []
+    ready = bool(validation.get("ready", False)) if isinstance(validation, dict) else False
+    errors = validation.get("errors", []) if isinstance(validation, dict) else []
+    error_text = ""
+    if errors:
+        parts: list[str] = []
+        for item in errors:
+            language = str(item.get("language", "unknown"))
+            server = str(item.get("server", ""))
+            reason = str(item.get("reason", "unknown error"))
+            parts.append(f"{language}/{server}: {reason}")
+        error_text = "；".join(parts)
+    scores = perception.get("language_scores", {})
+    skill_files = perception.get("skill_files", [])
+    summary = (
+        f"语言识别：{json.dumps(scores, ensure_ascii=False)}；"
+        f"技能文件：{json.dumps(skill_files, ensure_ascii=False)}；"
+        f"LSP校验：{json.dumps(checks, ensure_ascii=False)}"
+    )
+    result: AuditState = {
+        "skill_prompt": prompt_text,
+        "perception_summary": summary,
+        "lsp_ready": ready,
+    }
+    if not ready:
+        result["lsp_error"] = error_text or "LSP 服务不可用"
+        result["audit_output"] = f"感知阶段失败：{result['lsp_error']}"
+    return result
+
+
 def planner_execute_node_factory(planner: Any):
     def planner_execute_node(state: AuditState) -> AuditState:
+        if not bool(state.get("lsp_ready", False)):
+            message = state.get("lsp_error", "").strip() or "LSP 服务不可用，终止审计执行"
+            return {
+                "planner_summary": "已在感知阶段终止",
+                "plan": "未进入审计执行阶段",
+                "audit_output": f"感知阶段拦截：{message}",
+            }
         request = state.get("user_request", "").strip() or DEFAULT_AUDIT_REQUEST
         workspace_path = state.get("workspace_path", "").strip()
         skill_prompt = state.get("skill_prompt", "")
@@ -225,10 +277,12 @@ def finalizer_node(state: AuditState) -> AuditState:
     workspace_path = state.get("workspace_path", "").strip()
     planner_summary = state.get("planner_summary", "").strip()
     plan = state.get("plan", "").strip()
+    perception_summary = state.get("perception_summary", "").strip()
     audit_output = state.get("audit_output", "").strip()
     final_output = (
         f"审计任务: {request}\n"
         f"工作区: {workspace_path}\n\n"
+        f"感知结果:\n{perception_summary or '无'}\n\n"
         f"规划摘要:\n{planner_summary or '无'}\n\n"
         f"执行计划:\n{plan}\n\n"
         f"审计结论:\n{audit_output}"
@@ -242,9 +296,11 @@ def build_cli_graph(model: Any | None = None, executor: Any | None = None):
     active_executor = executor or build_executor(active_model)
     planner = build_audit_planner(model=active_model, executor=active_executor)
     graph = StateGraph(AuditState)
+    graph.add_node("perceive", perception_node)
     graph.add_node("plan_execute", planner_execute_node_factory(planner))
     graph.add_node("finalize", finalizer_node)
-    graph.add_edge(START, "plan_execute")
+    graph.add_edge(START, "perceive")
+    graph.add_edge("perceive", "plan_execute")
     graph.add_edge("plan_execute", "finalize")
     graph.add_edge("finalize", END)
     return graph.compile()
@@ -268,7 +324,6 @@ async def _run_audit_cli_async(
     payload = {
         "user_request": user_request.strip() or DEFAULT_AUDIT_REQUEST,
         "workspace_path": str(Path(workspace_path).resolve()),
-        "skill_prompt": load_static_audit_prompt(workspace_path),
     }
     await stream_handler.start()
     result: dict[str, Any] = {}
