@@ -9,6 +9,7 @@ from langchain_community.tools.file_management import (
 
 from tools.description.description import TOOL_DESCRIPTIONS
 from tools.grep import grep_search
+from tools.gui_ipc import gui_agent_run
 from tools.lsp import (
     lsp_change_document,
     lsp_close_document,
@@ -46,6 +47,7 @@ def _tool_registry() -> dict[str, Any]:
         "semgrep_scan": semgrep_scan,
         "list_audit_rules": list_audit_rules,
         "audit_codebase": audit_codebase,
+        "gui_agent_run": gui_agent_run,
         "lsp_start_session": lsp_start_session,
         "lsp_stop_session": lsp_stop_session,
         "lsp_list_sessions": lsp_list_sessions,

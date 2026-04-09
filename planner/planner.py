@@ -252,7 +252,12 @@ class PlanAndExecutePlanner:
     ) -> tuple[bool, str]:
         try:
             if step.mode == "gui_test":
-                return self._execute_gui_step(step)
+                return self._execute_gui_step(
+                    objective=objective,
+                    context=context,
+                    step=step,
+                    history=history,
+                )
             prompt = self._build_execution_prompt(
                 objective=objective,
                 context=context,
@@ -370,20 +375,41 @@ class PlanAndExecutePlanner:
             for step in history
         )
 
-    def _execute_gui_step(self, step: PlanStep) -> tuple[bool, str]:
-        executor = self._get_gui_executor()
-        payload = executor.run(step.objective, max_steps=self.gui_max_steps)
-        result = json.dumps(payload, ensure_ascii=False, indent=2)
-        status = _stringify(payload.get("status", "")).strip().lower() if isinstance(payload, dict) else ""
-        return status == "completed", result
-
-    def _get_gui_executor(self) -> Any:
-        if self.gui_executor is not None:
-            return self.gui_executor
-        from gui_agent.agent import GUIAgent
-
-        self.gui_executor = GUIAgent()
-        return self.gui_executor
+    def _execute_gui_step(
+        self,
+        objective: str,
+        context: str,
+        step: PlanStep,
+        history: list[PlanStep],
+    ) -> tuple[bool, str]:
+        history_text = self._history_text(history) or "无"
+        prompt = (
+            "当前是 GUI 测试步骤，请通过工具调用完成任务。\n"
+            "必须调用 gui_agent_run 工具执行 GUI 操作，不要假设执行结果。\n"
+            f"总目标:\n{objective}\n\n"
+            f"补充上下文:\n{context or '无'}\n\n"
+            f"已完成步骤:\n{history_text}\n\n"
+            f"当前步骤标题:\n{step.title}\n\n"
+            f"当前步骤目标:\n{step.objective}\n\n"
+            f"期望输出:\n{step.expected_output}\n\n"
+            f"调用 gui_agent_run 时请使用 max_steps={self.gui_max_steps}。\n"
+            "最后请输出：执行结果、关键证据、是否完成。"
+        )
+        response = self.executor_agent.invoke(
+            {
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": prompt,
+                    }
+                ]
+            }
+        )
+        text = _extract_text(response).strip()
+        lowered = text.lower()
+        failed_markers = ("gui tool error", '"status": "failed"', '"status":"failed"', '"status": "timeout"', '"status":"timeout"')
+        ok = not any(marker in lowered for marker in failed_markers)
+        return ok, text
 
 
 def build_plan_and_execute_planner(

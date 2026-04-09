@@ -167,7 +167,7 @@ def build_audit_planner(model: Any | None = None, executor: Any | None = None):
         gui_executor=None,
         verbose=True,
         max_replans=1,
-        gui_max_steps=0,
+        gui_max_steps=8,
     )
 
 
@@ -249,8 +249,8 @@ def planner_execute_node_factory(planner: Any):
         skill_prompt = state.get("skill_prompt", "")
         context = (
             f"工作区路径：{workspace_path}\n"
-            "当前 agent 仅执行静态代码审计，不包含 GUI 测试。\n"
-            "请仅使用静态审计相关工具完成任务。\n\n"
+            "请优先使用静态审计工具；若任务需要界面交互验证，可调用 gui_agent_run 工具。\n"
+            "涉及 GUI 的结论必须基于工具输出，不可臆测。\n\n"
             f"执行提示词：\n{skill_prompt}"
         )
         result = planner.invoke(
@@ -379,8 +379,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-
-
-
-

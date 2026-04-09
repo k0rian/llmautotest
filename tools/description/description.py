@@ -31,6 +31,10 @@ TOOL_DESCRIPTIONS = {
         "category": "analysis",
         "description": "- Run combined audit using semgrep and built-in pattern rules\n- Returns merged findings with severity summary",
     },
+    "gui_agent_run": {
+        "category": "gui",
+        "description": "- Execute GUI interaction task through gui_agent\n- Supports step limit and history reset\n- Returns structured execution status/details JSON text",
+    },
     "lsp_start_session": {"category": "lsp", "description": "- Start and initialize an LSP session for a workspace"},
     "lsp_stop_session": {"category": "lsp", "description": "- Stop an LSP session and release resources"},
     "lsp_list_sessions": {"category": "lsp", "description": "- List current LSP sessions and status"},
