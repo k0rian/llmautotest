@@ -35,6 +35,10 @@ TOOL_DESCRIPTIONS = {
         "category": "gui",
         "description": "- Execute GUI interaction task through gui_agent\n- Supports step limit and history reset\n- Returns structured execution status/details JSON text",
     },
+    "run_shell_command": {
+        "category": "shell",
+        "description": "- Execute CLI commands in current environment\n- Commands may require explicit user confirmation before running\n- Returns JSON payload with return code, stdout, stderr and cwd",
+    },
     "lsp_start_session": {"category": "lsp", "description": "- Start and initialize an LSP session for a workspace"},
     "lsp_stop_session": {"category": "lsp", "description": "- Stop an LSP session and release resources"},
     "lsp_list_sessions": {"category": "lsp", "description": "- List current LSP sessions and status"},

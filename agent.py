@@ -1,15 +1,17 @@
-import argparse
+﻿import argparse
+import asyncio
 import json
+import logging
+import os
+import sys
+import traceback
 from pathlib import Path
 from typing import Any, TypedDict
-import traceback
-import logging
+
+from langchain_core.callbacks import BaseCallbackHandler
+
 from llm_utils.config_loader import load_api_key
 from router.router import build_perception_result
-import sys
-import os
-import asyncio
-from langchain_core.callbacks import BaseCallbackHandler
 
 RUNTIME_IMPORT_ERROR: Exception | None = None
 
@@ -26,7 +28,7 @@ except ModuleNotFoundError as exc:
 os.environ["PYTHONUTF8"] = "1"
 DEFAULT_MODEL_NAME = "doubao-seed-1-6-lite-251015"
 DEFAULT_BASE_URL = "https://ark.cn-beijing.volces.com/api/v3"
-DEFAULT_AUDIT_REQUEST = "请对当前工作区执行静态代码审计，重点关注 bug、性能问题和可优化点。"
+DEFAULT_AUDIT_REQUEST = "Run a static code audit for the current workspace, focusing on bugs, performance issues, and optimization opportunities."
 PROMPT_FILE = Path(__file__).resolve().parent / "PROMPT.md"
 TYPEWRITER_DELAY = 0.01
 LOGGER = logging.getLogger(__name__)
@@ -66,9 +68,8 @@ class TypewriterStreamHandler(BaseCallbackHandler):
 
     def on_llm_new_token(self, token: str, **kwargs: Any) -> None:
         text = token or ""
-        if not text:
-            return
-        self._loop.call_soon_threadsafe(self._queue.put_nowait, text)
+        if text:
+            self._loop.call_soon_threadsafe(self._queue.put_nowait, text)
 
     async def _run(self) -> None:
         while True:
@@ -81,12 +82,15 @@ class TypewriterStreamHandler(BaseCallbackHandler):
                     await asyncio.sleep(self._delay)
 
 
-def build_model(
-    model_name: str = DEFAULT_MODEL_NAME,
-    base_url: str = DEFAULT_BASE_URL,
-) -> Any:
-    _ensure_runtime_dependencies()
+def _ensure_runtime_dependencies() -> None:
+    if RUNTIME_IMPORT_ERROR is not None:
+        raise RuntimeError(
+            "Missing runtime dependencies. Please install requirements.txt before running CLI agent."
+        ) from RUNTIME_IMPORT_ERROR
 
+
+def build_model(model_name: str = DEFAULT_MODEL_NAME, base_url: str = DEFAULT_BASE_URL) -> Any:
+    _ensure_runtime_dependencies()
     return ChatOpenAI(
         model=model_name,
         base_url=base_url,
@@ -128,31 +132,19 @@ def _read_text(value: Any) -> str:
     return str(value)
 
 
-
 def load_static_audit_prompt(workspace_path: str) -> str:
     perception = build_perception_result(workspace_path=workspace_path, base_prompt_file=PROMPT_FILE)
     prompt_text = str(perception.get("system_prompt", "")).strip()
     if not prompt_text:
-        LOGGER.error("Prompt 文件为空或技能路由失败: %s", PROMPT_FILE)
-        raise RuntimeError(f"Prompt 文件为空或技能路由失败: {PROMPT_FILE}")
+        LOGGER.error("Prompt file is empty or skill routing failed: %s", PROMPT_FILE)
+        raise RuntimeError(f"Prompt file is empty or skill routing failed: {PROMPT_FILE}")
     return prompt_text
-
-
-def _ensure_runtime_dependencies() -> None:
-    if RUNTIME_IMPORT_ERROR is not None:
-        raise RuntimeError(
-            "缺少运行依赖，请先安装 requirements.txt 中的依赖后再运行 CLI agent"
-        ) from RUNTIME_IMPORT_ERROR
 
 
 def build_executor(model: Any | None = None):
     _ensure_runtime_dependencies()
     active_model = model or build_model()
-    return create_agent(
-        active_model,
-        tools=build_static_audit_tools(),
-        # verbose=True,
-    )
+    return create_agent(active_model, tools=build_static_audit_tools())
 
 
 def build_audit_planner(model: Any | None = None, executor: Any | None = None):
@@ -176,7 +168,7 @@ def _format_steps(steps: list[dict[str, Any]]) -> str:
         return ""
     lines: list[str] = []
     for index, step in enumerate(steps, start=1):
-        title = _read_text(step.get("title", f"步骤 {index}")).strip() or f"步骤 {index}"
+        title = _read_text(step.get("title", f"Step {index}")).strip() or f"Step {index}"
         mode = _read_text(step.get("mode", "code_audit")).strip() or "code_audit"
         objective = _read_text(step.get("objective", "")).strip()
         lines.append(f"{index}. [{mode}] {title}")
@@ -190,24 +182,27 @@ def perception_node(state: AuditState) -> AuditState:
     if not workspace_path:
         return {
             "lsp_ready": False,
-            "lsp_error": "工作区路径为空，无法执行感知阶段",
-            "perception_summary": "感知失败：缺少工作区路径",
-            "audit_output": "感知阶段失败：工作区路径为空，无法校验技能与 LSP 服务",
+            "lsp_error": "Workspace path is empty",
+            "perception_summary": "Perception failed: missing workspace path",
+            "audit_output": "Perception failed before planning: workspace path is required",
         }
+
     try:
         perception = build_perception_result(workspace_path=workspace_path, base_prompt_file=PROMPT_FILE)
     except Exception as exc:
         return {
             "lsp_ready": False,
             "lsp_error": str(exc),
-            "perception_summary": f"感知阶段异常：{str(exc)}",
-            "audit_output": f"感知阶段失败：{str(exc)}",
+            "perception_summary": f"Perception error: {exc}",
+            "audit_output": f"Perception stage failed: {exc}",
         }
+
     prompt_text = str(perception.get("system_prompt", "")).strip()
     validation = perception.get("lsp_validation", {})
     checks = validation.get("checks", []) if isinstance(validation, dict) else []
     ready = bool(validation.get("ready", False)) if isinstance(validation, dict) else False
     errors = validation.get("errors", []) if isinstance(validation, dict) else []
+
     error_text = ""
     if errors:
         parts: list[str] = []
@@ -216,43 +211,47 @@ def perception_node(state: AuditState) -> AuditState:
             server = str(item.get("server", ""))
             reason = str(item.get("reason", "unknown error"))
             parts.append(f"{language}/{server}: {reason}")
-        error_text = "；".join(parts)
+        error_text = "; ".join(parts)
+
     scores = perception.get("language_scores", {})
     skill_files = perception.get("skill_files", [])
     summary = (
-        f"语言识别：{json.dumps(scores, ensure_ascii=False)}；"
-        f"技能文件：{json.dumps(skill_files, ensure_ascii=False)}；"
-        f"LSP校验：{json.dumps(checks, ensure_ascii=False)}"
+        f"Language detection: {json.dumps(scores, ensure_ascii=False)}; "
+        f"Skill files: {json.dumps(skill_files, ensure_ascii=False)}; "
+        f"LSP checks: {json.dumps(checks, ensure_ascii=False)}"
     )
+
     result: AuditState = {
         "skill_prompt": prompt_text,
         "perception_summary": summary,
         "lsp_ready": ready,
     }
     if not ready:
-        result["lsp_error"] = error_text or "LSP 服务不可用"
-        result["audit_output"] = f"感知阶段失败：{result['lsp_error']}"
+        result["lsp_error"] = error_text or "LSP service is unavailable"
+        result["audit_output"] = f"Perception stage blocked execution: {result['lsp_error']}"
     return result
 
 
 def planner_execute_node_factory(planner: Any):
     def planner_execute_node(state: AuditState) -> AuditState:
         if not bool(state.get("lsp_ready", False)):
-            message = state.get("lsp_error", "").strip() or "LSP 服务不可用，终止审计执行"
+            message = state.get("lsp_error", "").strip() or "LSP service is unavailable"
             return {
-                "planner_summary": "已在感知阶段终止",
-                "plan": "未进入审计执行阶段",
-                "audit_output": f"感知阶段拦截：{message}",
+                "planner_summary": "Stopped in perception stage",
+                "plan": "Execution stage was skipped",
+                "audit_output": f"Perception gate blocked execution: {message}",
             }
+
         request = state.get("user_request", "").strip() or DEFAULT_AUDIT_REQUEST
         workspace_path = state.get("workspace_path", "").strip()
         skill_prompt = state.get("skill_prompt", "")
         context = (
-            f"工作区路径：{workspace_path}\n"
-            "请优先使用静态审计工具；若任务需要界面交互验证，可调用 gui_agent_run 工具。\n"
-            "涉及 GUI 的结论必须基于工具输出，不可臆测。\n\n"
-            f"执行提示词：\n{skill_prompt}"
+            f"Workspace path: {workspace_path}\n"
+            "Prioritize static audit tools. If UI interaction verification is required, call gui_agent_run.\n"
+            "Any GUI conclusion must be based on tool outputs.\n\n"
+            f"Execution prompt:\n{skill_prompt}"
         )
+
         result = planner.invoke(
             {
                 "objective": request,
@@ -280,12 +279,12 @@ def finalizer_node(state: AuditState) -> AuditState:
     perception_summary = state.get("perception_summary", "").strip()
     audit_output = state.get("audit_output", "").strip()
     final_output = (
-        f"审计任务: {request}\n"
-        f"工作区: {workspace_path}\n\n"
-        f"感知结果:\n{perception_summary or '无'}\n\n"
-        f"规划摘要:\n{planner_summary or '无'}\n\n"
-        f"执行计划:\n{plan}\n\n"
-        f"审计结论:\n{audit_output}"
+        f"Audit Task: {request}\n"
+        f"Workspace: {workspace_path}\n\n"
+        f"Perception:\n{perception_summary or 'N/A'}\n\n"
+        f"Plan Summary:\n{planner_summary or 'N/A'}\n\n"
+        f"Execution Plan:\n{plan}\n\n"
+        f"Audit Conclusion:\n{audit_output}"
     )
     return {"final_output": final_output}
 
@@ -331,6 +330,7 @@ async def _run_audit_cli_async(
         result = await app.ainvoke(payload, config={"callbacks": [stream_handler]})
     finally:
         await stream_handler.stop()
+
     final_output = _read_text(result.get("final_output", "")).strip()
     if final_output:
         print()
@@ -338,43 +338,52 @@ async def _run_audit_cli_async(
     return final_output
 
 
-def run_audit_cli(
-    user_request: str,
-    workspace_path: str,
-    model: Any | None = None,
-) -> str:
+def run_audit_cli(user_request: str, workspace_path: str, model: Any | None = None) -> str:
     return asyncio.run(_run_audit_cli_async(user_request, workspace_path, model=model))
+
+
+def _print_cli_header(workspace_path: str) -> None:
+    print()
+    print("=" * 68)
+    print("LLM AutoTest CLI  |  Static Audit + Tool Orchestration")
+    print("-" * 68)
+    print(f"Workspace : {workspace_path}")
+    print("=" * 68)
 
 
 def _interactive_loop(workspace_path: str) -> None:
     while True:
-        raw = input("\n请输入审计任务，直接回车使用默认任务，输入 exit 退出:\n> ").strip()
+        raw = input("\nTask (press Enter to use default, type exit to quit)\n> ").strip()
         if raw.lower() in {"exit", "quit"}:
+            print("\nSession ended.")
             break
         request = raw or DEFAULT_AUDIT_REQUEST
-        print()
+        print("\n[Running] Executing audit workflow...\n")
         try:
             run_audit_cli(request, workspace_path)
         except RuntimeError as exc:
-            print(f"CLI 运行失败: {exc}")
+            print(f"[Error] CLI execution failed: {exc}")
             break
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="静态代码审计 CLI Agent")
-    parser.add_argument("task", nargs="?", default=DEFAULT_AUDIT_REQUEST, help="审计任务描述")
-    parser.add_argument("--path", default=".", help="要审计的工作区路径")
-    parser.add_argument("--interactive", action="store_true", help="启动交互式命令行模式")
+    parser = argparse.ArgumentParser(description="Static code audit CLI agent")
+    parser.add_argument("task", nargs="?", default=DEFAULT_AUDIT_REQUEST, help="Audit task description")
+    parser.add_argument("--path", default=".", help="Workspace path")
+    parser.add_argument("--interactive", action="store_true", help="Start interactive mode")
     args = parser.parse_args()
 
     workspace_path = str(Path(args.path).resolve())
+    _print_cli_header(workspace_path)
     if args.interactive:
         _interactive_loop(workspace_path)
         return
+
+    print("\n[Running] Executing audit workflow...\n")
     try:
         run_audit_cli(args.task, workspace_path)
     except RuntimeError as exc:
-        print(f"CLI 运行失败: {exc}")
+        print(f"[Error] CLI execution failed: {exc}")
 
 
 if __name__ == "__main__":
