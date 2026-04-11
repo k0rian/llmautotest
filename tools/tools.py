@@ -11,7 +11,7 @@ from tools.description.description import TOOL_DESCRIPTIONS
 from tools.grep import grep_search
 from tools.gui_ipc import gui_agent_run
 from tools.shell import run_shell_command
-from tools.semantic_diff_ts import (
+from tools.semantic_diff import (
     semantic_diff_with_description,
     semantic_index_functions,
     semantic_search_functions,

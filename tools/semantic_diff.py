@@ -595,13 +595,11 @@ def semantic_diff_with_description(
 
 # ======================== Tree-sitter implementation override ========================
 # Keep public tool names unchanged while replacing the parser backend.
+import importlib
 from typing import Callable
 
-from tree_sitter import Language, Node, Parser
-import tree_sitter_c as _ts_c
-import tree_sitter_javascript as _ts_javascript
-import tree_sitter_python as _ts_python
-import tree_sitter_typescript as _ts_typescript
+from tree_sitter import Node, Parser
+import tree_sitter_language_pack as _ts_pack
 
 
 DEFAULT_INCLUDE_GLOB = "*.py,*.js,*.jsx,*.ts,*.tsx,*.c,*.h,*.cc,*.cpp,*.hpp"
@@ -643,12 +641,6 @@ _INDEX_CACHE = {}
 _PARSER_FACTORIES: dict[str, Callable[[], Parser]] = {}
 
 
-def _build_parser(language_obj: Any) -> Parser:
-    parser = Parser()
-    parser.language = Language(language_obj)
-    return parser
-
-
 def _register_parser_factory(language: str, factory: Callable[[], Parser]) -> None:
     if language not in _PARSER_FACTORIES:
         _PARSER_FACTORIES[language] = factory
@@ -657,11 +649,45 @@ def _register_parser_factory(language: str, factory: Callable[[], Parser]) -> No
 def _init_parser_factories() -> None:
     if _PARSER_FACTORIES:
         return
-    _register_parser_factory("python", lambda: _build_parser(_ts_python.language()))
-    _register_parser_factory("javascript", lambda: _build_parser(_ts_javascript.language()))
-    _register_parser_factory("typescript", lambda: _build_parser(_ts_typescript.language_typescript()))
-    _register_parser_factory("tsx", lambda: _build_parser(_ts_typescript.language_tsx()))
-    _register_parser_factory("c", lambda: _build_parser(_ts_c.language()))
+    targets = ("python", "javascript", "typescript", "tsx", "c", "cpp")
+    try:
+        available = set(_ts_pack.available_languages())
+    except Exception:
+        available = set()
+
+    # Primary path: language-pack locally available parsers.
+    for language in targets:
+        if available and language not in available:
+            continue
+        if not available:
+            break
+        try:
+            parser = _ts_pack.get_parser(language)
+            _register_parser_factory(language, lambda parser=parser: parser)
+        except Exception:
+            continue
+
+    # Fallback path: optional per-language bindings, only when pack has no local parsers.
+    if _PARSER_FACTORIES:
+        return
+    fallback_specs = {
+        "python": ("tree_sitter_python", "language"),
+        "javascript": ("tree_sitter_javascript", "language"),
+        "typescript": ("tree_sitter_typescript", "language_typescript"),
+        "tsx": ("tree_sitter_typescript", "language_tsx"),
+        "c": ("tree_sitter_c", "language"),
+    }
+    from tree_sitter import Language
+
+    for language, (module_name, fn_name) in fallback_specs.items():
+        try:
+            mod = importlib.import_module(module_name)
+            lang_obj = getattr(mod, fn_name)()
+            parser = Parser()
+            parser.language = Language(lang_obj)
+            _register_parser_factory(language, lambda parser=parser: parser)
+        except Exception:
+            continue
 
 
 def _parser_for_language(language: str) -> Parser | None:
