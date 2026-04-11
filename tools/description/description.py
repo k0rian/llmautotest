@@ -39,6 +39,18 @@ TOOL_DESCRIPTIONS = {
         "category": "shell",
         "description": "- Execute CLI commands in current environment\n- Commands may require explicit user confirmation before running\n- Returns JSON payload with return code, stdout, stderr and cwd",
     },
+    "semantic_index_functions": {
+        "category": "semantic",
+        "description": "- Build function-level semantic index for codebase\n- Extracts Python/JS/TS functions and vectorizes signatures/docs/source\n- Use this before large-scale semantic retrieval tasks",
+    },
+    "semantic_search_functions": {
+        "category": "semantic",
+        "description": "- Semantic retrieve functions by natural language query\n- Returns most relevant functions with score and location\n- Suitable for mapping requirement text to implementation points",
+    },
+    "semantic_diff_with_description": {
+        "category": "semantic",
+        "description": "- Compare implementation with user description (PRD/API docs)\n- Generates coverage summary: covered/partial/missing requirements\n- Also lists potentially undocumented functions",
+    },
     "lsp_start_session": {"category": "lsp", "description": "- Start and initialize an LSP session for a workspace"},
     "lsp_stop_session": {"category": "lsp", "description": "- Stop an LSP session and release resources"},
     "lsp_list_sessions": {"category": "lsp", "description": "- List current LSP sessions and status"},

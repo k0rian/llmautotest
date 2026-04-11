@@ -11,6 +11,11 @@ from tools.description.description import TOOL_DESCRIPTIONS
 from tools.grep import grep_search
 from tools.gui_ipc import gui_agent_run
 from tools.shell import run_shell_command
+from tools.semantic_diff_ts import (
+    semantic_diff_with_description,
+    semantic_index_functions,
+    semantic_search_functions,
+)
 from tools.lsp import (
     lsp_change_document,
     lsp_close_document,
@@ -50,6 +55,9 @@ def _tool_registry() -> dict[str, Any]:
         "audit_codebase": audit_codebase,
         "gui_agent_run": gui_agent_run,
         "run_shell_command": run_shell_command,
+        "semantic_index_functions": semantic_index_functions,
+        "semantic_search_functions": semantic_search_functions,
+        "semantic_diff_with_description": semantic_diff_with_description,
         "lsp_start_session": lsp_start_session,
         "lsp_stop_session": lsp_stop_session,
         "lsp_list_sessions": lsp_list_sessions,
