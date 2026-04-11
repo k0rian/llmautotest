@@ -1,3 +1,4 @@
+import json
 import traceback
 from pathlib import Path
 from typing import Any
@@ -78,11 +79,18 @@ def planner_execute_node_factory(planner: Any):
         request = state.get("user_request", "").strip() or DEFAULT_AUDIT_REQUEST
         workspace_path = state.get("workspace_path", "").strip()
         skill_prompt = state.get("skill_prompt", "")
+        perception_meta = state.get("perception_meta", {})
+        hint_text = ""
+        if isinstance(perception_meta, dict):
+            hints = perception_meta.get("project_hints", {})
+            if hints:
+                hint_text = f"\nPerception hints:\n{json.dumps(hints, ensure_ascii=False)}"
         context = (
             f"Workspace path: {workspace_path}\n"
             "Prioritize static audit tools. If UI interaction verification is required, call gui_agent_run.\n"
             "Any GUI conclusion must be based on tool outputs.\n\n"
             f"Execution prompt:\n{skill_prompt}"
+            f"{hint_text}"
         )
 
         result = planner.invoke(
@@ -95,10 +103,12 @@ def planner_execute_node_factory(planner: Any):
         summary = read_text(result.get("summary", "")).strip()
         steps_text = format_steps(result.get("steps", []))
         final_response = read_text(result.get("final_response", "")).strip()
+        runtime_state = result.get("runtime_state")
         return {
             "planner_summary": summary,
             "plan": steps_text,
             "audit_output": final_response,
+            "planner_runtime": runtime_state if isinstance(runtime_state, dict) else {},
         }
 
     return planner_execute_node

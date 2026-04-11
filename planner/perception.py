@@ -25,6 +25,12 @@ def perception_node(state: AuditState) -> AuditState:
             "lsp_ready": False,
             "lsp_error": "Workspace path is empty",
             "perception_summary": "Perception failed: missing workspace path",
+            "perception_meta": {
+                "workspace_root": workspace_path,
+                "lsp_ready": False,
+                "lsp_error": "Workspace path is empty",
+                "project_hints": {},
+            },
             "audit_output": "Perception failed before planning: workspace path is required",
         }
 
@@ -35,6 +41,12 @@ def perception_node(state: AuditState) -> AuditState:
             "lsp_ready": False,
             "lsp_error": str(exc),
             "perception_summary": f"Perception error: {exc}",
+            "perception_meta": {
+                "workspace_root": workspace_path,
+                "lsp_ready": False,
+                "lsp_error": str(exc),
+                "project_hints": {},
+            },
             "audit_output": f"Perception stage failed: {exc}",
         }
 
@@ -66,6 +78,16 @@ def perception_node(state: AuditState) -> AuditState:
         "skill_prompt": prompt_text,
         "perception_summary": summary,
         "lsp_ready": ready,
+        "perception_meta": {
+            "workspace_root": workspace_path,
+            "lsp_ready": ready,
+            "lsp_error": error_text,
+            "project_hints": {
+                "language_scores": scores,
+                "skill_files": skill_files,
+                "lsp_checks": checks,
+            },
+        },
     }
     if not ready:
         result["lsp_error"] = error_text or "LSP service is unavailable"

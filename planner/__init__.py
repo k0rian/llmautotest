@@ -1,5 +1,14 @@
 from planner.planner import PlanAndExecutePlanner, build_plan_and_execute_planner
-from planner.types import AuditState, PlanStep, PlannerRunResult, StepMode
+from planner.types import (
+    AuditState,
+    EvidenceItem,
+    PlanStep,
+    PlannerRunResult,
+    PlannerRuntimeState,
+    StepMode,
+    StepOutcome,
+    ToolExecutionRecord,
+)
 from planner.workflow import (
     build_audit_planner,
     build_cli_graph,
@@ -14,6 +23,10 @@ __all__ = [
     "StepMode",
     "PlanStep",
     "PlannerRunResult",
+    "PlannerRuntimeState",
+    "StepOutcome",
+    "ToolExecutionRecord",
+    "EvidenceItem",
     "PlanAndExecutePlanner",
     "build_plan_and_execute_planner",
     "build_model",

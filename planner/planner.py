@@ -7,12 +7,30 @@ from langchain.agents import create_agent
 from langchain_openai import ChatOpenAI
 
 from llm_utils.config_loader import load_api_key
-from planner.policies import DEFAULT_BASE_URL, DEFAULT_MODEL_NAME
-from planner.state import read_text
-from planner.types import PlanStep, PlannerRunResult
-from planner.verifier import build_replan_reason, verify_step_result
+from planner.policies import DEFAULT_BASE_URL, DEFAULT_MODEL_NAME, DEFAULT_MAX_REPLANS
+from planner.state import (
+    advance_step,
+    append_evidence,
+    append_open_question,
+    append_tool_record,
+    create_runtime_state,
+    get_current_step,
+    increment_replan_count,
+    mark_step_completed,
+    mark_step_failed,
+    mark_step_running,
+    read_text,
+)
+from planner.types import EvidenceItem, PlanStep, PlannerRunResult, PlannerRuntimeState, ToolExecutionRecord
+from planner.verifier import (
+    build_replan_reason,
+    build_step_outcome,
+    should_trigger_replan,
+    verify_step_result,
+)
 from tools.description.description import TOOL_DESCRIPTIONS
 from tools.tools import build_tools
+
 
 def build_planner_model(
     model_name: str = DEFAULT_MODEL_NAME,
@@ -61,6 +79,25 @@ def _tool_description_text() -> str:
         description = meta.get("description", "")
         blocks.append(f"{name} [{category}]\n{description}")
     return "\n\n".join(blocks)
+
+
+def _extract_evidence_items(step: PlanStep, text: str) -> list[EvidenceItem]:
+    normalized = text.strip()
+    if not normalized:
+        return []
+    confidence = 0.6
+    lowered = normalized.lower()
+    if "line " in lowered or "file" in lowered or "证据" in normalized:
+        confidence = 0.8
+    return [
+        EvidenceItem(
+            id=f"ev-{step.id}-{step.attempt_count}",
+            step_id=step.id,
+            source_type="executor_text",
+            summary=normalized[:280],
+            confidence=confidence,
+        )
+    ]
 
 
 class PlanAndExecutePlanner:
@@ -133,55 +170,89 @@ class PlanAndExecutePlanner:
 
     def execute(self, objective: str, context: str = "", max_steps: int | None = None) -> PlannerRunResult:
         if not objective or not objective.strip():
+            empty_state = create_runtime_state(objective="", context=context, summary="", steps=[])
+            empty_state.status = "failed"
             return PlannerRunResult(
                 objective="",
                 summary="",
                 steps=[],
                 final_response="objective 不能为空",
                 status="failed",
+                runtime_state=empty_state.to_dict(),
             )
+
         summary, steps = self.create_plan(objective=objective.strip(), context=context)
         if max_steps is not None:
             limit = max(1, int(max_steps))
             steps = steps[:limit]
-        replans = 0
-        index = 0
-        while index < len(steps):
-            step = steps[index]
-            ok, result = self.execute_step(objective=objective, context=context, step=step, history=steps[:index])
-            step.result = result
-            step.status = "completed" if ok else "failed"
-            if ok:
-                index += 1
-                continue
-            if replans >= self.max_replans:
-                final_response = self.summarize_execution(objective, summary, steps)
-                return PlannerRunResult(
-                    objective=objective,
-                    summary=summary,
-                    steps=steps,
-                    final_response=final_response,
-                    status="failed",
-                )
-            replans += 1
-            remaining = self.replan(objective=objective, context=context, summary=summary, completed_steps=steps[:index], failed_step=step)
-            if not remaining:
-                final_response = self.summarize_execution(objective, summary, steps)
-                return PlannerRunResult(
-                    objective=objective,
-                    summary=summary,
-                    steps=steps,
-                    final_response=final_response,
-                    status="failed",
-                )
-            steps = steps[:index] + remaining
-        final_response = self.summarize_execution(objective, summary, steps)
-        return PlannerRunResult(
-            objective=objective,
+
+        runtime_state = create_runtime_state(
+            objective=objective.strip(),
+            context=context,
             summary=summary,
             steps=steps,
+        )
+
+        while True:
+            step = get_current_step(runtime_state)
+            if step is None:
+                runtime_state.status = "completed"
+                break
+
+            mark_step_running(runtime_state, step.id)
+            result_text, tool_record = self.execute_step(
+                objective=runtime_state.objective,
+                context=runtime_state.context,
+                step=step,
+                history=runtime_state.steps[: runtime_state.current_step_index],
+                runtime_state=runtime_state,
+            )
+            append_tool_record(runtime_state, tool_record)
+            verified, reason = verify_step_result(step.mode, result_text)
+            evidence_items = _extract_evidence_items(step, result_text)
+            for evidence in evidence_items:
+                append_evidence(runtime_state, evidence)
+            outcome = build_step_outcome(
+                step=step,
+                text=result_text,
+                verified=verified,
+                reason=reason,
+                evidence_ids=[item.id for item in evidence_items],
+            )
+
+            if outcome.status == "completed":
+                mark_step_completed(runtime_state, step.id, result_text, notes=outcome.summary)
+                advance_step(runtime_state)
+                continue
+
+            mark_step_failed(runtime_state, step.id, result_text, failure_reason=outcome.replan_reason or reason)
+            append_open_question(runtime_state, f"{step.id} failed: {outcome.replan_reason or reason}")
+            if should_trigger_replan(outcome, runtime_state, max_replans=self.max_replans):
+                increment_replan_count(runtime_state)
+                remaining = self.replan(
+                    state=runtime_state,
+                    failed_step=step,
+                    reason=outcome.replan_reason or reason,
+                )
+                if remaining:
+                    runtime_state.steps = runtime_state.steps[: runtime_state.current_step_index] + remaining
+                    continue
+
+            runtime_state.status = "failed"
+            break
+
+        final_response = self.summarize_execution(
+            objective=runtime_state.objective,
+            summary=runtime_state.plan_summary,
+            steps=runtime_state.steps,
+        )
+        return PlannerRunResult(
+            objective=runtime_state.objective,
+            summary=runtime_state.plan_summary,
+            steps=runtime_state.steps,
             final_response=final_response,
-            status="completed",
+            status=runtime_state.status,
+            runtime_state=runtime_state.to_dict(),
         )
 
     def execute_step(
@@ -190,25 +261,32 @@ class PlanAndExecutePlanner:
         context: str,
         step: PlanStep,
         history: list[PlanStep],
-    ) -> tuple[bool, str]:
-        try:
-            if step.mode == "gui_test":
-                ok, text = self._execute_gui_step(
-                    objective=objective,
-                    context=context,
-                    step=step,
-                    history=history,
-                )
-                if not ok:
-                    return False, text
-                verified, _ = verify_step_result(step.mode, text)
-                return verified, text
-            prompt = self._build_execution_prompt(
+        runtime_state: PlannerRuntimeState,
+    ) -> tuple[str, ToolExecutionRecord]:
+        tool_id = f"tool-{len(runtime_state.tool_history or []) + 1}"
+        if step.mode == "gui_test":
+            text = self._execute_gui_step(
                 objective=objective,
                 context=context,
                 step=step,
                 history=history,
             )
+            return text, ToolExecutionRecord(
+                id=tool_id,
+                step_id=step.id,
+                tool_name="executor_agent(gui)",
+                input_summary=f"{step.mode}:{step.objective[:120]}",
+                output_summary=text[:200],
+                success="failed" not in text.lower() and "timeout" not in text.lower(),
+            )
+
+        prompt = self._build_execution_prompt(
+            objective=objective,
+            context=context,
+            step=step,
+            history=history,
+        )
+        try:
             response = self.executor_agent.invoke(
                 {
                     "messages": [
@@ -220,26 +298,38 @@ class PlanAndExecutePlanner:
                 }
             )
             text = _extract_text(response).strip()
-            ok, _ = verify_step_result(step.mode, text)
-            return ok, text
+            return text, ToolExecutionRecord(
+                id=tool_id,
+                step_id=step.id,
+                tool_name="executor_agent",
+                input_summary=f"{step.mode}:{step.objective[:120]}",
+                output_summary=text[:200],
+                success=True,
+            )
         except Exception as exc:
-            return False, str(exc)
+            text = str(exc)
+            return text, ToolExecutionRecord(
+                id=tool_id,
+                step_id=step.id,
+                tool_name="executor_agent",
+                input_summary=f"{step.mode}:{step.objective[:120]}",
+                output_summary=text[:200],
+                success=False,
+                error_message=text,
+            )
 
     def replan(
         self,
-        objective: str,
-        context: str,
-        summary: str,
-        completed_steps: list[PlanStep],
+        state: PlannerRuntimeState,
         failed_step: PlanStep,
+        reason: str,
     ) -> list[PlanStep]:
+        completed_steps = [step for step in state.steps if step.status == "completed"]
         completed_text = self._history_text(completed_steps)
         failure_reason = build_replan_reason(
-            objective=objective,
-            summary=summary,
-            completed_steps=completed_steps,
+            runtime_state=state,
             failed_step=failed_step,
-            reason=failed_step.result or "step_failed",
+            reason=reason,
         )
         failed_text = json.dumps(asdict(failed_step), ensure_ascii=False, indent=2)
         prompt = (
@@ -249,9 +339,9 @@ class PlanAndExecutePlanner:
             "步骤数量控制在 1 到 4 步。"
             "只返回 JSON，不要使用 markdown。"
             'JSON 格式为 {"steps":[{"title":"...","mode":"code_audit","objective":"...","expected_output":"..."}]}。'
-            f"\n\n总目标：\n{objective}"
-            f"\n\n规划摘要：\n{summary}"
-            f"\n\n上下文：\n{context or '无'}"
+            f"\n\n总目标：\n{state.objective}"
+            f"\n\n规划摘要：\n{state.plan_summary}"
+            f"\n\n上下文：\n{state.context or '无'}"
             f"\n\n已完成步骤：\n{completed_text or '无'}"
             f"\n\n失败信息摘要：\n{failure_reason}"
             f"\n\n失败步骤：\n{failed_text}"
@@ -336,7 +426,7 @@ class PlanAndExecutePlanner:
         context: str,
         step: PlanStep,
         history: list[PlanStep],
-    ) -> tuple[bool, str]:
+    ) -> str:
         history_text = self._history_text(history) or "无"
         prompt = (
             "当前是 GUI 测试步骤，请通过工具调用完成任务。\n"
@@ -360,9 +450,7 @@ class PlanAndExecutePlanner:
                 ]
             }
         )
-        text = _extract_text(response).strip()
-        ok, _ = verify_step_result(step.mode, text)
-        return ok, text
+        return _extract_text(response).strip()
 
 
 def build_plan_and_execute_planner(
