@@ -11,10 +11,22 @@ from typing import Any, Callable
 
 from langchain.tools import tool
 from tree_sitter import Language, Node, Parser
-import tree_sitter_c as ts_c
-import tree_sitter_javascript as ts_javascript
-import tree_sitter_python as ts_python
-import tree_sitter_typescript as ts_typescript
+try:
+    import tree_sitter_c as ts_c
+except Exception:
+    ts_c = None
+try:
+    import tree_sitter_javascript as ts_javascript
+except Exception:
+    ts_javascript = None
+try:
+    import tree_sitter_python as ts_python
+except Exception:
+    ts_python = None
+try:
+    import tree_sitter_typescript as ts_typescript
+except Exception:
+    ts_typescript = None
 
 
 SKIP_DIRS = {
@@ -183,11 +195,15 @@ def _register_parser_factory(language: str, factory: Callable[[], Parser]) -> No
 def _init_parser_factories() -> None:
     if _PARSER_FACTORIES:
         return
-    _register_parser_factory("python", lambda: _build_parser(ts_python.language()))
-    _register_parser_factory("javascript", lambda: _build_parser(ts_javascript.language()))
-    _register_parser_factory("typescript", lambda: _build_parser(ts_typescript.language_typescript()))
-    _register_parser_factory("tsx", lambda: _build_parser(ts_typescript.language_tsx()))
-    _register_parser_factory("c", lambda: _build_parser(ts_c.language()))
+    if ts_python is not None:
+        _register_parser_factory("python", lambda: _build_parser(ts_python.language()))
+    if ts_javascript is not None:
+        _register_parser_factory("javascript", lambda: _build_parser(ts_javascript.language()))
+    if ts_typescript is not None:
+        _register_parser_factory("typescript", lambda: _build_parser(ts_typescript.language_typescript()))
+        _register_parser_factory("tsx", lambda: _build_parser(ts_typescript.language_tsx()))
+    if ts_c is not None:
+        _register_parser_factory("c", lambda: _build_parser(ts_c.language()))
 
 
 def _parser_for_language(language: str) -> Parser | None:

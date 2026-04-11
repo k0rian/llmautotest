@@ -1,51 +1,22 @@
 import json
 import re
-from dataclasses import asdict, dataclass
-from typing import Any, Literal
+from dataclasses import asdict
+from typing import Any
 
 from langchain.agents import create_agent
 from langchain_openai import ChatOpenAI
 
 from llm_utils.config_loader import load_api_key
+from planner.policies import DEFAULT_BASE_URL, DEFAULT_MODEL_NAME
+from planner.state import read_text
+from planner.types import PlanStep, PlannerRunResult
+from planner.verifier import build_replan_reason, verify_step_result
 from tools.description.description import TOOL_DESCRIPTIONS
 from tools.tools import build_tools
 
-
-StepMode = Literal["code_audit", "gui_test", "analysis"]
-
-
-@dataclass
-class PlanStep:
-    id: str
-    title: str
-    mode: StepMode
-    objective: str
-    expected_output: str
-    status: str = "pending"
-    result: str = ""
-
-
-@dataclass
-class PlannerRunResult:
-    objective: str
-    summary: str
-    steps: list[PlanStep]
-    final_response: str
-    status: str
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "objective": self.objective,
-            "summary": self.summary,
-            "steps": [asdict(step) for step in self.steps],
-            "final_response": self.final_response,
-            "status": self.status,
-        }
-
-
 def build_planner_model(
-    model_name: str = "doubao-seed-1-6-251015",
-    base_url: str = "https://ark.cn-beijing.volces.com/api/v3",
+    model_name: str = DEFAULT_MODEL_NAME,
+    base_url: str = DEFAULT_BASE_URL,
 ) -> ChatOpenAI:
     return ChatOpenAI(
         model=model_name,
@@ -63,38 +34,8 @@ def build_executor_agent(model: ChatOpenAI | None = None, verbose: bool = False)
     )
 
 
-def _stringify(value: Any) -> str:
-    if value is None:
-        return ""
-    if isinstance(value, str):
-        return value
-    if isinstance(value, list):
-        parts: list[str] = []
-        for item in value:
-            if isinstance(item, str):
-                parts.append(item)
-            elif isinstance(item, dict):
-                text = item.get("text") or item.get("content")
-                parts.append(text if isinstance(text, str) else json.dumps(item, ensure_ascii=False))
-            else:
-                parts.append(str(item))
-        return "\n".join(part for part in parts if part)
-    if isinstance(value, dict):
-        return json.dumps(value, ensure_ascii=False, indent=2)
-    return str(value)
-
-
 def _extract_text(payload: Any) -> str:
-    if isinstance(payload, dict):
-        if "messages" in payload and payload["messages"]:
-            return _extract_text(payload["messages"][-1])
-        if "output" in payload:
-            return _extract_text(payload["output"])
-        return _stringify(payload)
-    content = getattr(payload, "content", None)
-    if content is not None:
-        return _stringify(content)
-    return _stringify(payload)
+    return read_text(payload)
 
 
 def _parse_json_payload(text: str) -> dict[str, Any]:
@@ -149,7 +90,7 @@ class PlanAndExecutePlanner:
             or inputs.get("query")
             or ""
         )
-        context = _stringify(inputs.get("context", ""))
+        context = read_text(inputs.get("context", ""))
         max_steps = inputs.get("max_steps")
         result = self.execute(objective=objective, context=context, max_steps=max_steps)
         return result.to_dict()
@@ -172,7 +113,7 @@ class PlanAndExecutePlanner:
         raw = _extract_text(self.planner_model.invoke(prompt))
         try:
             payload = _parse_json_payload(raw)
-            summary = _stringify(payload.get("summary", "")).strip() or "执行任务规划"
+            summary = read_text(payload.get("summary", "")).strip() or "执行任务规划"
             steps_data = payload.get("steps", [])
             steps = self._normalize_steps(steps_data)
             if not steps:
@@ -252,12 +193,16 @@ class PlanAndExecutePlanner:
     ) -> tuple[bool, str]:
         try:
             if step.mode == "gui_test":
-                return self._execute_gui_step(
+                ok, text = self._execute_gui_step(
                     objective=objective,
                     context=context,
                     step=step,
                     history=history,
                 )
+                if not ok:
+                    return False, text
+                verified, _ = verify_step_result(step.mode, text)
+                return verified, text
             prompt = self._build_execution_prompt(
                 objective=objective,
                 context=context,
@@ -274,7 +219,9 @@ class PlanAndExecutePlanner:
                     ]
                 }
             )
-            return True, _extract_text(response).strip()
+            text = _extract_text(response).strip()
+            ok, _ = verify_step_result(step.mode, text)
+            return ok, text
         except Exception as exc:
             return False, str(exc)
 
@@ -287,6 +234,13 @@ class PlanAndExecutePlanner:
         failed_step: PlanStep,
     ) -> list[PlanStep]:
         completed_text = self._history_text(completed_steps)
+        failure_reason = build_replan_reason(
+            objective=objective,
+            summary=summary,
+            completed_steps=completed_steps,
+            failed_step=failed_step,
+            reason=failed_step.result or "step_failed",
+        )
         failed_text = json.dumps(asdict(failed_step), ensure_ascii=False, indent=2)
         prompt = (
             "你需要基于已经完成的步骤和失败信息重新规划剩余步骤。"
@@ -299,6 +253,7 @@ class PlanAndExecutePlanner:
             f"\n\n规划摘要：\n{summary}"
             f"\n\n上下文：\n{context or '无'}"
             f"\n\n已完成步骤：\n{completed_text or '无'}"
+            f"\n\n失败信息摘要：\n{failure_reason}"
             f"\n\n失败步骤：\n{failed_text}"
         )
         try:
@@ -331,16 +286,16 @@ class PlanAndExecutePlanner:
         for idx, item in enumerate(steps_data, start=1):
             if not isinstance(item, dict):
                 continue
-            mode = _stringify(item.get("mode", "code_audit")).strip() or "code_audit"
+            mode = read_text(item.get("mode", "code_audit")).strip() or "code_audit"
             if mode not in {"code_audit", "gui_test", "analysis"}:
                 mode = "code_audit"
             steps.append(
                 PlanStep(
                     id=f"step-{idx}",
-                    title=_stringify(item.get("title", f"步骤 {idx}")).strip() or f"步骤 {idx}",
+                    title=read_text(item.get("title", f"步骤 {idx}")).strip() or f"步骤 {idx}",
                     mode=mode,
-                    objective=_stringify(item.get("objective", "")).strip() or _stringify(item.get("title", f"步骤 {idx}")),
-                    expected_output=_stringify(item.get("expected_output", "")).strip() or "返回本步骤结果",
+                    objective=read_text(item.get("objective", "")).strip() or read_text(item.get("title", f"步骤 {idx}")),
+                    expected_output=read_text(item.get("expected_output", "")).strip() or "返回本步骤结果",
                 )
             )
         return steps
@@ -406,9 +361,7 @@ class PlanAndExecutePlanner:
             }
         )
         text = _extract_text(response).strip()
-        lowered = text.lower()
-        failed_markers = ("gui tool error", '"status": "failed"', '"status":"failed"', '"status": "timeout"', '"status":"timeout"')
-        ok = not any(marker in lowered for marker in failed_markers)
+        ok, _ = verify_step_result(step.mode, text)
         return ok, text
 
 
