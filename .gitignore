@@ -8,4 +8,5 @@ __pycache__/
 .vs
 *.docx
 tests/
+.cache*/
 论文*

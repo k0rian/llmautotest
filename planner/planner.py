@@ -31,7 +31,7 @@ from planner.verifier import (
     verify_step_result,
 )
 from tools.description.description import TOOL_DESCRIPTIONS
-from tools.semantic_diff import semantic_diff_with_description, semantic_index_functions
+from tools.semantic_diff_ts import semantic_diff_with_description, semantic_index_functions
 from tools.tools import build_tools
 
 PROMPT_DIR = Path(__file__).resolve().parent / "prompt"

@@ -1,17 +1,18 @@
+﻿
 import json
-import importlib
+import hashlib
 import math
 import os
 import re
-from collections import Counter
+from collections import Counter, defaultdict
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from fnmatch import fnmatch
 from pathlib import Path
 from typing import Any, Callable
 
 from langchain.tools import tool
-from tree_sitter import Node, Parser
+from tree_sitter import Node, Parser, Query, QueryCursor
 import tree_sitter_language_pack as ts_pack
 
 
@@ -32,6 +33,10 @@ SKIP_DIRS = {
 DEFAULT_INCLUDE_GLOB = "*.py,*.js,*.jsx,*.ts,*.tsx,*.c,*.h,*.cc,*.cpp,*.hpp"
 MAX_FILE_BYTES = 1024 * 1024
 MAX_SOURCE_CHARS = 2400
+INDEX_CACHE_DIRNAME = ".llmautotest"
+INDEX_CACHE_SUBDIR = "semantic_index"
+SUPPORTED_LANGUAGES = ("python", "javascript", "typescript", "tsx", "c", "cpp")
+STRICT_NATIVE_LANGUAGES = {"c", "cpp"}
 
 CHINESE_KEYWORD_ALIASES = {
     "静态": ["static"],
@@ -52,11 +57,87 @@ CHINESE_KEYWORD_ALIASES = {
     "配置": ["config"],
 }
 
+_C_QUERY_FUNCTION_DEFINITION = r"""
+(function_definition
+  declarator: (function_declarator
+    declarator: (identifier) @func.name
+    parameters: (parameter_list) @func.params)
+  body: (compound_statement) @func.body) @func.def
+
+(function_definition
+  declarator: (pointer_declarator
+    declarator: (function_declarator
+      declarator: (identifier) @func.name
+      parameters: (parameter_list) @func.params))
+  body: (compound_statement) @func.body) @func.def
+"""
+
+_C_QUERY_FUNCTION_DECLARATION = r"""
+(declaration
+  declarator: (function_declarator
+    declarator: (identifier) @func.name
+    parameters: (parameter_list) @func.params)) @func.decl
+
+(declaration
+  declarator: (pointer_declarator
+    declarator: (function_declarator
+      declarator: (identifier) @func.name
+      parameters: (parameter_list) @func.params))) @func.decl
+"""
+
+_CPP_QUERY_FUNCTION_DEFINITION = r"""
+(function_definition
+  declarator: [
+    (function_declarator
+      declarator: (identifier) @func.name
+      parameters: (parameter_list) @func.params)
+
+    (function_declarator
+      declarator: (field_identifier) @func.name
+      parameters: (parameter_list) @func.params)
+
+    (function_declarator
+      declarator: (qualified_identifier
+        name: (identifier) @func.name)
+      parameters: (parameter_list) @func.params)
+
+    (function_declarator
+      declarator: (qualified_identifier
+        name: (destructor_name) @func.name)
+      parameters: (parameter_list) @func.params)
+  ]
+  body: (compound_statement) @func.body) @func.def
+"""
+
+_CPP_QUERY_FUNCTION_DECLARATION = r"""
+(declaration
+  declarator: [
+    (function_declarator
+      declarator: (identifier) @func.name
+      parameters: (parameter_list) @func.params)
+
+    (function_declarator
+      declarator: (field_identifier) @func.name
+      parameters: (parameter_list) @func.params)
+
+    (function_declarator
+      declarator: (qualified_identifier
+        name: (identifier) @func.name)
+      parameters: (parameter_list) @func.params)
+
+    (function_declarator
+      declarator: (qualified_identifier
+        name: (destructor_name) @func.name)
+      parameters: (parameter_list) @func.params)
+  ]) @func.decl
+"""
+
 
 @dataclass
 class FunctionRecord:
     file: str
     language: str
+    kind: str
     name: str
     signature: str
     start_line: int
@@ -77,14 +158,147 @@ class SemanticIndex:
     function_count: int
     functions: list[FunctionRecord]
     idf: dict[str, float]
+    parser_status: dict[str, str]
+    parser_errors: dict[str, str]
+    language_symbol_counts: dict[str, dict[str, int]]
+    indexed_files_by_language: dict[str, int]
 
 
 _INDEX_CACHE: dict[str, SemanticIndex] = {}
 _PARSER_FACTORIES: dict[str, Callable[[], Parser]] = {}
+_PARSER_STATUS: dict[str, str] = {}
+_PARSER_ERRORS: dict[str, str] = {}
+_QUERY_CACHE: dict[str, Query] = {}
 
 
 def _cache_key(root: str, include_glob: str) -> str:
     return f"{Path(root).resolve()}::{include_glob.strip().lower()}"
+
+
+def _index_cache_dir(path: str) -> Path:
+    return Path(path).resolve() / INDEX_CACHE_DIRNAME / INDEX_CACHE_SUBDIR
+
+
+def _index_cache_file(path: str, include_glob: str) -> Path:
+    digest = hashlib.sha1(_cache_key(path, include_glob).encode("utf-8")).hexdigest()
+    return _index_cache_dir(path) / f"{digest}.json"
+
+
+def _index_to_payload(index: SemanticIndex) -> dict[str, Any]:
+    return {
+        "version": 1,
+        "root": index.root,
+        "include_glob": index.include_glob,
+        "created_at": index.created_at,
+        "file_count": index.file_count,
+        "function_count": index.function_count,
+        "idf": index.idf,
+        "parser_status": index.parser_status,
+        "parser_errors": index.parser_errors,
+        "language_symbol_counts": index.language_symbol_counts,
+        "indexed_files_by_language": index.indexed_files_by_language,
+        "functions": [
+            {
+                "file": item.file,
+                "language": item.language,
+                "kind": item.kind,
+                "name": item.name,
+                "signature": item.signature,
+                "start_line": item.start_line,
+                "end_line": item.end_line,
+                "doc": item.doc,
+                "source": item.source,
+                "token_tf": item.token_tf,
+                "vector": item.vector,
+                "norm": item.norm,
+            }
+            for item in index.functions
+        ],
+    }
+
+
+def _index_from_payload(payload: dict[str, Any]) -> SemanticIndex:
+    functions: list[FunctionRecord] = []
+    for item in payload.get("functions", []):
+        if not isinstance(item, dict):
+            continue
+        functions.append(
+            FunctionRecord(
+                file=str(item.get("file", "")),
+                language=str(item.get("language", "unknown")),
+                kind=str(item.get("kind", "function_definition")),
+                name=str(item.get("name", "")),
+                signature=str(item.get("signature", "")),
+                start_line=int(item.get("start_line", 0) or 0),
+                end_line=int(item.get("end_line", 0) or 0),
+                doc=str(item.get("doc", "")),
+                source=str(item.get("source", "")),
+                token_tf={str(k): float(v) for k, v in dict(item.get("token_tf", {})).items()},
+                vector={str(k): float(v) for k, v in dict(item.get("vector", {})).items()},
+                norm=float(item.get("norm", 0.0) or 0.0),
+            )
+        )
+
+    raw_lsc = payload.get("language_symbol_counts", {})
+    language_symbol_counts: dict[str, dict[str, int]] = {}
+    if isinstance(raw_lsc, dict):
+        for language, kinds in raw_lsc.items():
+            if not isinstance(kinds, dict):
+                continue
+            language_symbol_counts[str(language)] = {str(k): int(v) for k, v in kinds.items()}
+
+    raw_ifl = payload.get("indexed_files_by_language", {})
+    indexed_files_by_language = (
+        {str(k): int(v) for k, v in raw_ifl.items()} if isinstance(raw_ifl, dict) else {}
+    )
+    raw_parser_status = payload.get("parser_status", {})
+    parser_status = (
+        {str(k): str(v) for k, v in raw_parser_status.items()} if isinstance(raw_parser_status, dict) else {}
+    )
+    raw_parser_errors = payload.get("parser_errors", {})
+    parser_errors = (
+        {str(k): str(v) for k, v in raw_parser_errors.items()} if isinstance(raw_parser_errors, dict) else {}
+    )
+    raw_idf = payload.get("idf", {})
+    idf = {str(k): float(v) for k, v in raw_idf.items()} if isinstance(raw_idf, dict) else {}
+
+    return SemanticIndex(
+        root=str(payload.get("root", "")),
+        include_glob=str(payload.get("include_glob", DEFAULT_INCLUDE_GLOB)),
+        created_at=str(payload.get("created_at", "")),
+        file_count=int(payload.get("file_count", 0) or 0),
+        function_count=int(payload.get("function_count", len(functions)) or len(functions)),
+        functions=functions,
+        idf=idf,
+        parser_status=parser_status,
+        parser_errors=parser_errors,
+        language_symbol_counts=language_symbol_counts,
+        indexed_files_by_language=indexed_files_by_language,
+    )
+
+
+def _save_index_to_disk(path: str, include_glob: str, index: SemanticIndex) -> None:
+    cache_file = _index_cache_file(path=path, include_glob=include_glob)
+    cache_file.parent.mkdir(parents=True, exist_ok=True)
+    payload = _index_to_payload(index)
+    cache_file.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+
+def _load_index_from_disk(path: str, include_glob: str) -> SemanticIndex | None:
+    cache_file = _index_cache_file(path=path, include_glob=include_glob)
+    if not cache_file.exists() or not cache_file.is_file():
+        return None
+    try:
+        payload = json.loads(cache_file.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            return None
+        if str(payload.get("root", "")).strip() != str(Path(path).resolve()):
+            return None
+        if str(payload.get("include_glob", "")).strip().lower() != include_glob.strip().lower():
+            return None
+        return _index_from_payload(payload)
+    except Exception:
+        return None
 
 
 def _normalize_include_glob(include_glob: str) -> list[str]:
@@ -105,10 +319,9 @@ def _iter_code_files(root: Path, include_glob: str, max_files: int) -> list[Path
             full = Path(current_root) / name
             if not _is_code_file(full, patterns):
                 continue
-            try:
-                if full.stat().st_size > MAX_FILE_BYTES:
-                    continue
-            except OSError:
+            if not full.exists():
+                continue
+            if full.stat().st_size > MAX_FILE_BYTES:
                 continue
             files.append(full)
             if len(files) >= max_files:
@@ -142,7 +355,6 @@ def _tokenize(text: str) -> list[str]:
                     words.extend(aliases)
     return [item for item in words if len(item) >= 2]
 
-
 def _calc_tf(tokens: list[str]) -> dict[str, float]:
     if not tokens:
         return {}
@@ -167,55 +379,85 @@ def _calc_norm(vector: dict[str, float]) -> float:
     return math.sqrt(sum(value * value for value in vector.values()))
 
 
-def _build_parser(language_obj: Any) -> Parser:
-    _ = language_obj
-    raise RuntimeError("not used")
-
-
 def _register_parser_factory(language: str, factory: Callable[[], Parser]) -> None:
     if language not in _PARSER_FACTORIES:
         _PARSER_FACTORIES[language] = factory
 
 
+def _update_parser_error(language: str, message: str) -> None:
+    current = _PARSER_ERRORS.get(language)
+    if not current:
+        _PARSER_ERRORS[language] = message
+    elif message not in current:
+        _PARSER_ERRORS[language] = f"{current}; {message}"
+
+
+def _call_ts_pack_init(languages: list[str]) -> None:
+    init_fn = getattr(ts_pack, "init", None)
+    if init_fn is None:
+        return
+    attempts = (
+        ({"languages": languages},),
+        ({"parsers": languages},),
+        (languages,),
+        tuple(),
+    )
+    last_error: Exception | None = None
+    for args in attempts:
+        try:
+            init_fn(*args)
+            return
+        except TypeError as exc:
+            last_error = exc
+            continue
+    if last_error is not None:
+        raise RuntimeError(f"failed to call tree-sitter-language-pack init: {last_error}") from last_error
+
+
+def _call_ts_pack_download(languages: list[str]) -> None:
+    if not languages:
+        return
+    download_fn = getattr(ts_pack, "download", None)
+    if download_fn is None:
+        return
+    try:
+        download_fn(languages)
+    except TypeError as exc:
+        raise RuntimeError(f"failed to call tree-sitter-language-pack download: {exc}") from exc
+
+
 def _init_parser_factories() -> None:
     if _PARSER_FACTORIES:
         return
-    targets = ("python", "javascript", "typescript", "tsx", "c", "cpp")
+
+    _PARSER_STATUS.clear()
+    _PARSER_ERRORS.clear()
+    for language in SUPPORTED_LANGUAGES:
+        _PARSER_STATUS[language] = "pending"
+
     try:
+        _call_ts_pack_init(list(SUPPORTED_LANGUAGES))
         available = set(ts_pack.available_languages())
-    except Exception:
-        available = set()
+        missing = [language for language in SUPPORTED_LANGUAGES if language not in available]
+        if missing:
+            _call_ts_pack_download(missing)
 
-    for language in targets:
-        if available and language not in available:
-            continue
-        if not available:
-            break
-        try:
-            parser = ts_pack.get_parser(language)
-            _register_parser_factory(language, lambda parser=parser: parser)
-        except Exception:
-            continue
-
-    if _PARSER_FACTORIES:
-        return
-    fallback_specs = {
-        "python": ("tree_sitter_python", "language"),
-        "javascript": ("tree_sitter_javascript", "language"),
-        "typescript": ("tree_sitter_typescript", "language_typescript"),
-        "tsx": ("tree_sitter_typescript", "language_tsx"),
-        "c": ("tree_sitter_c", "language"),
-    }
-    from tree_sitter import Language
-    for language, (module_name, fn_name) in fallback_specs.items():
-        try:
-            mod = importlib.import_module(module_name)
-            lang_obj = getattr(mod, fn_name)()
-            parser = Parser()
-            parser.language = Language(lang_obj)
-            _register_parser_factory(language, lambda parser=parser: parser)
-        except Exception:
-            continue
+        for language in SUPPORTED_LANGUAGES:
+            try:
+                _ = ts_pack.get_language(language)
+                parser = ts_pack.get_parser(language)
+                _ = parser.parse(b"")
+                _register_parser_factory(language, lambda lang=language: ts_pack.get_parser(lang))
+                _PARSER_STATUS[language] = "ok"
+            except Exception as exc:
+                _PARSER_STATUS[language] = "failed"
+                _update_parser_error(language, f"parser validation failed: {exc}")
+    except Exception as exc:
+        for language in SUPPORTED_LANGUAGES:
+            if _PARSER_STATUS.get(language) == "pending":
+                _PARSER_STATUS[language] = "failed"
+                _update_parser_error(language, f"init stage failed: {exc}")
+        raise RuntimeError(f"failed to initialize tree-sitter parsers: {exc}") from exc
 
 
 def _parser_for_language(language: str) -> Parser | None:
@@ -224,6 +466,17 @@ def _parser_for_language(language: str) -> Parser | None:
     if factory is None:
         return None
     return factory()
+
+
+def _require_parsers(required_languages: set[str]) -> None:
+    if not required_languages:
+        return
+    _init_parser_factories()
+    missing = [lang for lang in sorted(required_languages) if _PARSER_STATUS.get(lang) != "ok"]
+    if not missing:
+        return
+    detail = "; ".join(f"{lang}: {_PARSER_ERRORS.get(lang, 'unknown error')}" for lang in missing)
+    raise RuntimeError(f"tree-sitter parser unavailable for {', '.join(missing)}; {detail}")
 
 
 def _detect_language(path: Path) -> str:
@@ -277,7 +530,6 @@ def _extract_python_doc_from_source(source: str) -> str:
         return ""
     return match.group(2).strip()[:600]
 
-
 def _extract_functions_python(path: Path, source: bytes, tree: Any) -> list[dict[str, Any]]:
     lines = source.decode("utf-8", errors="ignore").splitlines()
     functions: list[dict[str, Any]] = []
@@ -294,6 +546,7 @@ def _extract_functions_python(path: Path, source: bytes, tree: Any) -> list[dict
             {
                 "file": str(path.resolve()),
                 "language": "python",
+                "kind": "function_definition",
                 "name": name,
                 "signature": _signature_from_lines(lines, start_line),
                 "start_line": start_line,
@@ -319,6 +572,7 @@ def _extract_functions_js_ts(path: Path, source: bytes, tree: Any, language: str
                 {
                     "file": str(path.resolve()),
                     "language": language,
+                    "kind": "function_definition",
                     "name": name,
                     "signature": _signature_from_lines(lines, start_line),
                     "start_line": start_line,
@@ -343,6 +597,7 @@ def _extract_functions_js_ts(path: Path, source: bytes, tree: Any, language: str
             {
                 "file": str(path.resolve()),
                 "language": language,
+                "kind": "function_definition",
                 "name": name,
                 "signature": _signature_from_lines(lines, start_line),
                 "start_line": start_line,
@@ -354,61 +609,120 @@ def _extract_functions_js_ts(path: Path, source: bytes, tree: Any, language: str
     return functions
 
 
-def _find_first_identifier(source: bytes, root: Node) -> str:
-    for node in _iter_nodes(root):
-        if node.type == "identifier":
-            text = _node_text(source, node).strip()
-            if text:
-                return text
-    return ""
+def _query_source_for(language: str, mode: str) -> str:
+    key = f"{language}:{mode}"
+    mapping = {
+        "c:def": _C_QUERY_FUNCTION_DEFINITION,
+        "c:decl": _C_QUERY_FUNCTION_DECLARATION,
+        "cpp:def": _CPP_QUERY_FUNCTION_DEFINITION,
+        "cpp:decl": _CPP_QUERY_FUNCTION_DECLARATION,
+    }
+    if key not in mapping:
+        raise ValueError(f"unsupported query key: {key}")
+    return mapping[key]
 
 
-def _extract_functions_c_cpp(path: Path, source: bytes, tree: Any, language: str) -> list[dict[str, Any]]:
+def _get_query(language: str, mode: str) -> Query:
+    cache_key = f"{language}:{mode}"
+    cached = _QUERY_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+    lang_obj = ts_pack.get_language(language)
+    query = Query(lang_obj, _query_source_for(language, mode))
+    _QUERY_CACHE[cache_key] = query
+    return query
+
+
+def _capture_nodes(captures: Any, name: str) -> list[Node]:
+    if isinstance(captures, dict):
+        value = captures.get(name, [])
+        return [node for node in value if hasattr(node, "start_byte")]
+    nodes: list[Node] = []
+    if isinstance(captures, list):
+        for item in captures:
+            if not isinstance(item, tuple) or len(item) != 2:
+                continue
+            node, capture_name = item
+            if capture_name == name and hasattr(node, "start_byte"):
+                nodes.append(node)
+    return nodes
+
+
+def _extract_symbols_by_query(path: Path, source: bytes, tree: Any, language: str, mode: str) -> list[dict[str, Any]]:
+    query = _get_query(language, mode)
+    cursor = QueryCursor(query)
     lines = source.decode("utf-8", errors="ignore").splitlines()
-    functions: list[dict[str, Any]] = []
-    for node in _iter_nodes(tree.root_node):
-        if node.type != "function_definition":
+    symbols: list[dict[str, Any]] = []
+    seen: set[tuple[str, int, int, str]] = set()
+
+    for _, captures in cursor.matches(tree.root_node):
+        root_capture = "func.def" if mode == "def" else "func.decl"
+        root_nodes = _capture_nodes(captures, root_capture)
+        name_nodes = _capture_nodes(captures, "func.name")
+        params_nodes = _capture_nodes(captures, "func.params")
+
+        root_node = root_nodes[0] if root_nodes else None
+        name_node = name_nodes[0] if name_nodes else None
+        params_node = params_nodes[0] if params_nodes else None
+        if root_node is None or name_node is None:
             continue
-        declarator = node.child_by_field_name("declarator")
-        name = _find_first_identifier(source, declarator or node)
+
+        start_line = root_node.start_point[0] + 1
+        end_line = root_node.end_point[0] + 1
+        name = _node_text(source, name_node).strip()
         if not name:
             continue
-        start_line = node.start_point[0] + 1
-        end_line = node.end_point[0] + 1
-        functions.append(
+
+        params_text = _node_text(source, params_node).strip() if params_node is not None else "()"
+        line_sig = _signature_from_lines(lines, start_line)
+        signature = line_sig or f"{name}{params_text}"
+        kind = "function_definition" if mode == "def" else "function_declaration"
+
+        dedupe_key = (name, start_line, end_line, kind)
+        if dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+
+        symbols.append(
             {
                 "file": str(path.resolve()),
                 "language": language,
+                "kind": kind,
                 "name": name,
-                "signature": _signature_from_lines(lines, start_line),
+                "signature": signature,
                 "start_line": start_line,
                 "end_line": end_line,
                 "doc": "",
-                "source": _node_text(source, node)[:MAX_SOURCE_CHARS],
+                "source": _node_text(source, root_node)[:MAX_SOURCE_CHARS],
             }
         )
-    return functions
+    return symbols
 
+
+def _extract_functions_c_cpp_by_query(path: Path, source: bytes, tree: Any, language: str) -> list[dict[str, Any]]:
+    definitions = _extract_symbols_by_query(path, source, tree, language, mode="def")
+    declarations = _extract_symbols_by_query(path, source, tree, language, mode="decl")
+    return definitions + declarations
 
 def _extract_functions(path: Path) -> list[dict[str, Any]]:
     language = _detect_language(path)
+    source = path.read_bytes()
+    if not source.strip():
+        return []
+
     parser = _parser_for_language(language)
     if parser is None:
-        return []
-    try:
-        source = path.read_bytes()
-        if not source.strip():
-            return []
-        tree = parser.parse(source)
-    except Exception:
-        return []
+        detail = _PARSER_ERRORS.get(language, "parser is not initialized")
+        raise RuntimeError(f"missing parser for {language}: {detail}")
+
+    tree = parser.parse(source)
 
     if language == "python":
         return _extract_functions_python(path, source, tree)
     if language in {"javascript", "typescript", "tsx"}:
         return _extract_functions_js_ts(path, source, tree, language)
-    if language in {"c", "cpp"}:
-        return _extract_functions_c_cpp(path, source, tree, language)
+    if language in STRICT_NATIVE_LANGUAGES:
+        return _extract_functions_c_cpp_by_query(path, source, tree, language)
     return []
 
 
@@ -446,6 +760,7 @@ def _search_functions(index: SemanticIndex, query: str, top_k: int) -> list[dict
         result.append(
             {
                 "score": round(score, 4),
+                "kind": item.kind,
                 "name": item.name,
                 "signature": item.signature,
                 "file": item.file,
@@ -493,74 +808,113 @@ def _status_by_score(score: float) -> str:
 
 
 def _build_index(path: str, include_glob: str, max_files: int) -> SemanticIndex:
-    root = Path(path).resolve()
-    if not root.exists() or not root.is_dir():
-        raise ValueError(f"invalid directory path '{path}'")
+    try:
+        root = Path(path).resolve()
+        if not root.exists() or not root.is_dir():
+            raise ValueError(f"invalid directory path '{path}'")
 
-    file_paths = _iter_code_files(root=root, include_glob=include_glob, max_files=max_files)
-    raw_functions: list[dict[str, Any]] = []
-    for file_path in file_paths:
-        raw_functions.extend(_extract_functions(file_path))
+        file_paths = _iter_code_files(root=root, include_glob=include_glob, max_files=max_files)
+        indexed_files_by_language: dict[str, int] = defaultdict(int)
+        strict_languages_in_scope: set[str] = set()
+        for file_path in file_paths:
+            language = _detect_language(file_path)
+            if language == "unknown":
+                continue
+            indexed_files_by_language[language] += 1
+            if language in STRICT_NATIVE_LANGUAGES:
+                strict_languages_in_scope.add(language)
 
-    documents: list[list[str]] = []
-    for item in raw_functions:
-        semantic_text = " ".join(
-            [
-                item.get("name", ""),
-                item.get("signature", ""),
-                item.get("doc", ""),
-                Path(item.get("file", "")).name,
-            ]
-        )
-        body_text = item.get("source", "")
-        semantic_tokens = _tokenize(semantic_text)
-        body_tokens = _tokenize(body_text)
-        documents.append((semantic_tokens * 3) + body_tokens)
+        _require_parsers(strict_languages_in_scope)
 
-    df_counter: Counter[str] = Counter()
-    for tokens in documents:
-        for token in set(tokens):
-            df_counter[token] += 1
-    total_docs = max(1, len(documents))
-    idf = {token: math.log((total_docs + 1) / (freq + 1)) + 1.0 for token, freq in df_counter.items()}
+        raw_functions: list[dict[str, Any]] = []
+        for file_path in file_paths:
+            raw_functions.extend(_extract_functions(file_path))
 
-    function_records: list[FunctionRecord] = []
-    for item, tokens in zip(raw_functions, documents):
-        tf = _calc_tf(tokens)
-        vector = _calc_vector(tf, idf)
-        function_records.append(
-            FunctionRecord(
-                file=item["file"],
-                language=item["language"],
-                name=item["name"],
-                signature=item["signature"],
-                start_line=item["start_line"],
-                end_line=item["end_line"],
-                doc=item["doc"],
-                source=item["source"],
-                token_tf=tf,
-                vector=vector,
-                norm=_calc_norm(vector),
+        documents: list[list[str]] = []
+        for item in raw_functions:
+            semantic_text = " ".join(
+                [
+                    item.get("kind", ""),
+                    item.get("name", ""),
+                    item.get("signature", ""),
+                    item.get("doc", ""),
+                    Path(item.get("file", "")).name,
+                ]
             )
-        )
+            body_text = item.get("source", "")
+            semantic_tokens = _tokenize(semantic_text)
+            body_tokens = _tokenize(body_text)
+            documents.append((semantic_tokens * 3) + body_tokens)
 
-    return SemanticIndex(
-        root=str(root),
-        include_glob=include_glob,
-        created_at=datetime.utcnow().isoformat() + "Z",
-        file_count=len(file_paths),
-        function_count=len(function_records),
-        functions=function_records,
-        idf=idf,
-    )
+        df_counter: Counter[str] = Counter()
+        for tokens in documents:
+            for token in set(tokens):
+                df_counter[token] += 1
+        total_docs = max(1, len(documents))
+        idf = {token: math.log((total_docs + 1) / (freq + 1)) + 1.0 for token, freq in df_counter.items()}
+
+        language_symbol_counts: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+        function_records: list[FunctionRecord] = []
+        for item, tokens in zip(raw_functions, documents):
+            tf = _calc_tf(tokens)
+            vector = _calc_vector(tf, idf)
+            language_symbol_counts[item["language"]][item["kind"]] += 1
+            function_records.append(
+                FunctionRecord(
+                    file=item["file"],
+                    language=item["language"],
+                    kind=item["kind"],
+                    name=item["name"],
+                    signature=item["signature"],
+                    start_line=item["start_line"],
+                    end_line=item["end_line"],
+                    doc=item["doc"],
+                    source=item["source"],
+                    token_tf=tf,
+                    vector=vector,
+                    norm=_calc_norm(vector),
+                )
+            )
+
+        parser_status = {language: _PARSER_STATUS.get(language, "unknown") for language in SUPPORTED_LANGUAGES}
+        parser_errors = {
+            language: _PARSER_ERRORS.get(language, "")
+            for language in SUPPORTED_LANGUAGES
+            if _PARSER_ERRORS.get(language)
+        }
+
+        return SemanticIndex(
+            root=str(root),
+            include_glob=include_glob,
+            created_at=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            file_count=len(file_paths),
+            function_count=len(function_records),
+            functions=function_records,
+            idf=idf,
+            parser_status=parser_status,
+            parser_errors=parser_errors,
+            language_symbol_counts={
+                language: {kind: count for kind, count in kinds.items()}
+                for language, kinds in language_symbol_counts.items()
+            },
+            indexed_files_by_language=dict(indexed_files_by_language),
+        )
+    except Exception as exc:
+        raise RuntimeError(f"failed to build semantic index: {exc}") from exc
 
 
 def _get_or_create_index(path: str, include_glob: str, max_files: int, rebuild: bool) -> tuple[SemanticIndex, bool]:
     key = _cache_key(path, include_glob)
     if not rebuild and key in _INDEX_CACHE:
         return _INDEX_CACHE[key], True
+    if not rebuild:
+        disk_cached = _load_index_from_disk(path=path, include_glob=include_glob)
+        if disk_cached is not None:
+            _INDEX_CACHE[key] = disk_cached
+            return disk_cached, True
     index = _build_index(path=path, include_glob=include_glob, max_files=max_files)
     _INDEX_CACHE[key] = index
+    _save_index_to_disk(path=path, include_glob=include_glob, index=index)
     return index, False
 
 
@@ -582,6 +936,7 @@ def semantic_index_functions(
     """
     Build or refresh function-level semantic index for a codebase (Tree-sitter AST).
     """
+
     def _handler() -> dict[str, Any]:
         index, cache_hit = _get_or_create_index(
             path=path,
@@ -597,8 +952,14 @@ def semantic_index_functions(
             "file_count": index.file_count,
             "function_count": index.function_count,
             "cache_hit": cache_hit,
+            "cache_path": str(_index_cache_file(path=path, include_glob=include_glob)),
             "parser_languages": sorted(_PARSER_FACTORIES.keys()),
+            "parser_status": index.parser_status,
+            "parser_errors": index.parser_errors,
+            "language_symbol_counts": index.language_symbol_counts,
+            "indexed_files_by_language": index.indexed_files_by_language,
         }
+
     return _execute_tool(_handler, "semantic_index_functions")
 
 
@@ -614,6 +975,7 @@ def semantic_search_functions(
     """
     Semantic search over indexed functions using natural language query.
     """
+
     def _handler() -> dict[str, Any]:
         if not query.strip():
             raise ValueError("query cannot be empty")
@@ -627,6 +989,7 @@ def semantic_search_functions(
             "top_k": top_k,
             "hits": hits,
         }
+
     return _execute_tool(_handler, "semantic_search_functions")
 
 
@@ -643,6 +1006,7 @@ def semantic_diff_with_description(
     """
     Compare implementation functions with user description (PRD/API doc/etc.) and output semantic diff.
     """
+
     def _handler() -> dict[str, Any]:
         doc_text = _read_description_text(description=description, description_file=description_file)
         if not doc_text:
@@ -688,6 +1052,7 @@ def semantic_diff_with_description(
             undocumented_candidates.append(
                 {
                     "name": record.name,
+                    "kind": record.kind,
                     "file": record.file,
                     "start_line": record.start_line,
                     "signature": record.signature,
@@ -703,6 +1068,8 @@ def semantic_diff_with_description(
                 "created_at": index.created_at,
                 "file_count": index.file_count,
                 "function_count": index.function_count,
+                "language_symbol_counts": index.language_symbol_counts,
+                "indexed_files_by_language": index.indexed_files_by_language,
             },
             "summary": {
                 "requirements": len(requirement_matches),
@@ -720,4 +1087,5 @@ def semantic_diff_with_description(
                 "Function extraction is powered by Tree-sitter AST parsers.",
             ],
         }
+
     return _execute_tool(_handler, "semantic_diff_with_description")
