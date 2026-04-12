@@ -3,4 +3,4 @@ Prioritize static audit tools. If UI interaction verification is required, call 
 Any GUI conclusion must be based on tool outputs.
 
 Execution prompt:
-{skill_prompt}{hint_text}
+{skill_prompt}{hint_text}{fallback_guidance}{semantic_intent_guidance}

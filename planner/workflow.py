@@ -16,7 +16,7 @@ from planner.policies import (
     DEFAULT_MAX_STEPS,
     DEFAULT_MODEL_NAME,
 )
-from planner.state import build_perception_blocked_state, format_steps, read_text
+from planner.state import format_steps, read_text
 from planner.types import AuditState
 
 PROMPT_DIR = Path(__file__).resolve().parent / "prompt"
@@ -75,29 +75,71 @@ def build_audit_planner(model: Any | None = None, executor: Any | None = None):
 
 def planner_execute_node_factory(planner: Any):
     def planner_execute_node(state: AuditState) -> AuditState:
-        if not bool(state.get("lsp_ready", False)):
-            message = state.get("lsp_error", "").strip() or "LSP service is unavailable"
-            return build_perception_blocked_state(message)
-
         request = state.get("user_request", "").strip() or DEFAULT_AUDIT_REQUEST
         workspace_path = state.get("workspace_path", "").strip()
+        if not workspace_path:
+            return {
+                "planner_summary": "Stopped before planning",
+                "plan": "Execution stage was skipped",
+                "audit_output": "Workspace path is empty",
+                "planner_runtime": {},
+            }
+
         skill_prompt = state.get("skill_prompt", "")
         perception_meta = state.get("perception_meta", {})
+        lsp_ready = bool(state.get("lsp_ready", False))
+        lsp_error = state.get("lsp_error", "").strip()
+
+        semantic_intent = False
+        semantic_fallback = not lsp_ready
         hint_text = ""
+        fallback_guidance = ""
+        semantic_intent_guidance = ""
         if isinstance(perception_meta, dict):
             hints = perception_meta.get("project_hints", {})
+            if isinstance(hints, dict):
+                semantic_intent = bool(hints.get("semantic_intent", False))
+                semantic_fallback = bool(hints.get("semantic_fallback", semantic_fallback))
             if hints:
                 hint_text = f"\n\nPerception hints:\n{json.dumps(hints, ensure_ascii=False)}"
+
+        if semantic_fallback:
+            fallback_reason = lsp_error or "LSP service is unavailable"
+            fallback_guidance = (
+                "\n\nExecution fallback:\n"
+                "- LSP is unavailable, do not rely on LSP tools.\n"
+                "- Must include a semantic_diff step that runs semantic_index_functions + semantic_diff_with_description.\n"
+                "- Must include at least one code_audit step focused on file_search/grep_search/read_file evidence collection.\n"
+                f"- Fallback reason: {fallback_reason}"
+            )
+        if semantic_intent:
+            semantic_intent_guidance = (
+                "\n\nSemantic-intent directive:\n"
+                "- The request appears to require semantic index based analysis.\n"
+                "- Plan must include semantic_diff mode early and use it as a primary evidence source."
+            )
+
+        effective_request = request
+        if semantic_fallback or semantic_intent:
+            effective_request = (
+                f"{request}\n\n"
+                "[Planner directives]\n"
+                f"{'1) Must include semantic_diff step.\n' if (semantic_fallback or semantic_intent) else ''}"
+                f"{'2) Must include file search based code_audit step.\n' if semantic_fallback else ''}"
+            )
+
         context = render_txt(
             PROMPT_DIR / "workflow_context.txt",
             workspace_path=workspace_path,
             skill_prompt=skill_prompt,
             hint_text=hint_text,
+            fallback_guidance=fallback_guidance,
+            semantic_intent_guidance=semantic_intent_guidance,
         )
 
         result = planner.invoke(
             {
-                "objective": request,
+                "objective": effective_request,
                 "context": context,
                 "max_steps": DEFAULT_MAX_STEPS,
                 "workspace_path": workspace_path,

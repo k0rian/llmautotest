@@ -9,6 +9,30 @@ from planner.types import AuditState
 LOGGER = logging.getLogger(__name__)
 
 
+def _infer_semantic_intent(request: str) -> bool:
+    text = (request or "").strip().lower()
+    if not text:
+        return False
+    keywords = (
+        "semantic",
+        "index",
+        "diff",
+        "coverage",
+        "requirement",
+        "prd",
+        "spec",
+        "语义",
+        "索引",
+        "比对",
+        "对比",
+        "覆盖率",
+        "需求",
+        "设计文档",
+        "功能对齐",
+    )
+    return any(token in text for token in keywords)
+
+
 def load_static_audit_prompt(workspace_path: str) -> str:
     perception = build_perception_result(workspace_path=workspace_path, base_prompt_file=PROMPT_FILE)
     prompt_text = str(perception.get("system_prompt", "")).strip()
@@ -20,6 +44,8 @@ def load_static_audit_prompt(workspace_path: str) -> str:
 
 def perception_node(state: AuditState) -> AuditState:
     workspace_path = state.get("workspace_path", "").strip()
+    user_request = state.get("user_request", "").strip()
+    semantic_intent = _infer_semantic_intent(user_request)
     if not workspace_path:
         return {
             "lsp_ready": False,
@@ -71,7 +97,9 @@ def perception_node(state: AuditState) -> AuditState:
     summary = (
         f"Language detection: {json.dumps(scores, ensure_ascii=False)}; "
         f"Skill files: {json.dumps(skill_files, ensure_ascii=False)}; "
-        f"LSP checks: {json.dumps(checks, ensure_ascii=False)}"
+        f"LSP checks: {json.dumps(checks, ensure_ascii=False)}; "
+        f"Semantic intent: {semantic_intent}; "
+        f"LSP fallback active: {not ready}"
     )
 
     result: AuditState = {
@@ -86,10 +114,16 @@ def perception_node(state: AuditState) -> AuditState:
                 "language_scores": scores,
                 "skill_files": skill_files,
                 "lsp_checks": checks,
+                "semantic_intent": semantic_intent,
+                "semantic_fallback": not ready,
+                "execution_mode": "semantic_fallback" if not ready else "standard",
             },
         },
     }
     if not ready:
         result["lsp_error"] = error_text or "LSP service is unavailable"
-        result["audit_output"] = f"Perception stage blocked execution: {result['lsp_error']}"
+        result["perception_summary"] = (
+            f"{summary}; "
+            "Switching to semantic-index + file-search workflow because LSP is unavailable."
+        )
     return result
