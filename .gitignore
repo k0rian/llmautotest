@@ -4,3 +4,9 @@ __pycache__/
 *.json
 *test.py
 *.yml
+*.bin
+.vs
+*.docx
+tests/
+.cache*/
+论文*

@@ -1,0 +1,17 @@
+Overall objective:
+{objective}
+
+Current step title:
+{step_title}
+
+Current step objective:
+{step_objective}
+
+Expected output:
+{expected_output}
+
+Execution context:
+{context}
+
+Completed history:
+{history}

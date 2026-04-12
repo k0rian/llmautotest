@@ -1,0 +1,24 @@
+[project]
+name = "llmautotest"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "langchain>=1.2.15",
+    "langchain-community>=0.4.1",
+    "langchain-core>=1.2.28",
+    "langchain-openai>=1.1.12",
+    "langgraph>=1.1.6",
+    "pytesseract>=0.3.13",
+    "tree-sitter>=0.25.2",
+    "tree-sitter-language-pack>=1.5.0",
+    "ui-tars>=0.5.1",
+    "vllm>=0.11.0",
+]
+[tool.uv]
+# 核心设置：让 uv 知道它需要兼容 Windows 平台
+required-environments = [
+    "sys_platform == 'win32' and platform_machine == 'AMD64'",
+    "sys_platform == 'linux' and platform_machine == 'x86_64'"
+]

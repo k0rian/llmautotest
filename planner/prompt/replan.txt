@@ -1,0 +1,27 @@
+You need to replan remaining steps based on completed steps and failure details.
+- Do not repeat completed steps.
+- Return only remaining steps.
+- mode must be one of: code_audit, gui_test, analysis, semantic_diff.
+- Number of steps: 1 to 4.
+
+Return JSON only, no markdown.
+JSON format:
+{{"steps":[{{"title":"...","mode":"code_audit","objective":"...","expected_output":"..."}}]}}
+
+Overall objective:
+{objective}
+
+Plan summary:
+{plan_summary}
+
+Context:
+{context}
+
+Completed steps:
+{completed_text}
+
+Failure reason summary:
+{failure_reason}
+
+Failed step:
+{failed_step}

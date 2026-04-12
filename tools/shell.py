@@ -1,40 +1,46 @@
+import json
+import os
 import subprocess
+from pathlib import Path
+
 from langchain.tools import tool
 
+from permission.command_permission import request_command_permission
 
-SAFE_COMMANDS = {"semgrep", "bandit", "eslint", "gitleaks"}
-BLOCK_COMMANDS = {"rm", "sudo", "curl", "wget"}
-
-def ask_user_confirmation(cmd: str) -> bool:
-    answer = input(f"Agent wants to execute: {cmd}\nAllow? (y/n): ")
-    return answer.lower().startswith("y")
 
 @tool
-def run_shell_command(command: str):
+def run_shell_command(command: str, cwd: str = "", timeout_sec: int = 120) -> str:
     """
-    Execute shell commands for code analysis tools.
+    Execute a CLI command after interactive permission checks when needed.
     """
+    try:
+        allowed, detail = request_command_permission(command)
+    except Exception as exc:
+        return f"Shell tool error: {exc}"
 
-    parts = command.split()
-    base_cmd = parts[0]
-
-    if base_cmd in BLOCK_COMMANDS:
-        return "Command blocked for security reasons."
-
-    if base_cmd not in SAFE_COMMANDS:
-        allowed = ask_user_confirmation(command)
-        if not allowed:
-            return "User denied command execution."
+    if not allowed:
+        return f"Shell command denied: {detail.reason}"
 
     try:
+        resolved_cwd = str(Path(cwd).resolve()) if cwd and cwd.strip() else os.getcwd()
+        timeout = max(1, min(int(timeout_sec), 600))
         result = subprocess.run(
-            parts,
+            detail.argv,
+            cwd=resolved_cwd,
             capture_output=True,
             text=True,
-            timeout=120
+            timeout=timeout,
+            shell=False,
         )
-
-        return result.stdout[:10000]
-
-    except Exception as e:
-        return str(e)
+        payload = {
+            "command": " ".join(detail.argv),
+            "cwd": resolved_cwd,
+            "returncode": result.returncode,
+            "stdout": (result.stdout or "")[:12000],
+            "stderr": (result.stderr or "")[:6000],
+        }
+        return json.dumps(payload, ensure_ascii=False, indent=2)
+    except subprocess.TimeoutExpired:
+        return f"Shell command timeout after {timeout_sec} seconds"
+    except Exception as exc:
+        return f"Shell execution error: {exc}"
