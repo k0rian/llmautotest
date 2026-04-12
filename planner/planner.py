@@ -109,6 +109,18 @@ def _render_prompt(template_name: str, **kwargs: object) -> str:
     return render_txt(PROMPT_DIR / template_name, **kwargs)
 
 
+def _invoke_tool_callable(tool_obj: Any, **kwargs: Any) -> str:
+    func = getattr(tool_obj, "func", None)
+    if callable(func):
+        return read_text(func(**kwargs))
+    invoke = getattr(tool_obj, "invoke", None)
+    if callable(invoke):
+        return read_text(invoke(kwargs))
+    if callable(tool_obj):
+        return read_text(tool_obj(**kwargs))
+    raise TypeError(f"unsupported tool object: {type(tool_obj).__name__}")
+
+
 class PlanAndExecutePlanner:
     def __init__(
         self,
@@ -496,8 +508,13 @@ class PlanAndExecutePlanner:
             history=history,
         )
         try:
-            index_result = semantic_index_functions(path=resolved_workspace, rebuild=False)
-            diff_result = semantic_diff_with_description(
+            index_result = _invoke_tool_callable(
+                semantic_index_functions,
+                path=resolved_workspace,
+                rebuild=False,
+            )
+            diff_result = _invoke_tool_callable(
+                semantic_diff_with_description,
                 path=resolved_workspace,
                 description=description,
                 rebuild=False,
