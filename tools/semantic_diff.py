@@ -1,4 +1,5 @@
 import ast
+import hashlib
 import json
 import math
 import os
@@ -32,6 +33,8 @@ MAX_FILE_BYTES = 1024 * 1024
 MAX_SOURCE_CHARS = 2400
 
 _INDEX_CACHE: dict[str, "SemanticIndex"] = {}
+INDEX_CACHE_DIRNAME = ".llmautotest"
+INDEX_CACHE_SUBDIR = "semantic_index"
 CHINESE_KEYWORD_ALIASES = {
     "静态": ["static"],
     "扫描": ["scan"],
@@ -80,6 +83,115 @@ class SemanticIndex:
 
 def _cache_key(root: str, include_glob: str) -> str:
     return f"{Path(root).resolve()}::{include_glob.strip().lower()}"
+
+
+def _index_cache_dir(path: str) -> Path:
+    root = Path(path).resolve()
+    return root / INDEX_CACHE_DIRNAME / INDEX_CACHE_SUBDIR
+
+
+def _index_cache_file(path: str, include_glob: str) -> Path:
+    key = _cache_key(path, include_glob)
+    digest = hashlib.sha1(key.encode("utf-8")).hexdigest()
+    return _index_cache_dir(path) / f"{digest}.json"
+
+
+def _index_to_payload(index: SemanticIndex) -> dict[str, Any]:
+    return {
+        "version": 1,
+        "root": index.root,
+        "include_glob": index.include_glob,
+        "created_at": index.created_at,
+        "file_count": index.file_count,
+        "function_count": index.function_count,
+        "idf": index.idf,
+        "functions": [
+            {
+                "file": item.file,
+                "language": item.language,
+                "name": item.name,
+                "signature": item.signature,
+                "start_line": item.start_line,
+                "end_line": item.end_line,
+                "doc": item.doc,
+                "source": item.source,
+                "token_tf": item.token_tf,
+                "vector": item.vector,
+                "norm": item.norm,
+            }
+            for item in index.functions
+        ],
+    }
+
+
+def _index_from_payload(payload: dict[str, Any]) -> SemanticIndex:
+    functions_raw = payload.get("functions", [])
+    functions: list[FunctionRecord] = []
+    if isinstance(functions_raw, list):
+        for item in functions_raw:
+            if not isinstance(item, dict):
+                continue
+            functions.append(
+                FunctionRecord(
+                    file=str(item.get("file", "")),
+                    language=str(item.get("language", "unknown")),
+                    name=str(item.get("name", "")),
+                    signature=str(item.get("signature", "")),
+                    start_line=int(item.get("start_line", 0) or 0),
+                    end_line=int(item.get("end_line", 0) or 0),
+                    doc=str(item.get("doc", "")),
+                    source=str(item.get("source", "")),
+                    token_tf={str(k): float(v) for k, v in dict(item.get("token_tf", {})).items()},
+                    vector={str(k): float(v) for k, v in dict(item.get("vector", {})).items()},
+                    norm=float(item.get("norm", 0.0) or 0.0),
+                )
+            )
+
+    idf_raw = payload.get("idf", {})
+    idf = {str(k): float(v) for k, v in dict(idf_raw).items()} if isinstance(idf_raw, dict) else {}
+    return SemanticIndex(
+        root=str(payload.get("root", "")),
+        include_glob=str(payload.get("include_glob", DEFAULT_INCLUDE_GLOB)),
+        created_at=str(payload.get("created_at", "")),
+        file_count=int(payload.get("file_count", 0) or 0),
+        function_count=int(payload.get("function_count", len(functions)) or len(functions)),
+        functions=functions,
+        idf=idf,
+    )
+
+
+def _load_index_from_disk(path: str, include_glob: str) -> SemanticIndex | None:
+    cache_file = _index_cache_file(path=path, include_glob=include_glob)
+    if not cache_file.exists() or not cache_file.is_file():
+        return None
+    try:
+        payload = json.loads(cache_file.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if str(payload.get("root", "")).strip() != str(Path(path).resolve()):
+        return None
+    if str(payload.get("include_glob", "")).strip().lower() != include_glob.strip().lower():
+        return None
+    try:
+        return _index_from_payload(payload)
+    except Exception:
+        return None
+
+
+def _save_index_to_disk(path: str, include_glob: str, index: SemanticIndex) -> None:
+    cache_file = _index_cache_file(path=path, include_glob=include_glob)
+    cache_dir = cache_file.parent
+    payload = _index_to_payload(index)
+    try:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        tmp_file = cache_file.with_suffix(".tmp")
+        tmp_file.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        tmp_file.replace(cache_file)
+    except Exception:
+        # Disk cache is best-effort and must not break semantic workflow.
+        return
 
 
 def _normalize_include_glob(include_glob: str) -> list[str]:
@@ -355,8 +467,14 @@ def _get_or_create_index(path: str, include_glob: str, max_files: int, rebuild: 
     key = _cache_key(path, include_glob)
     if not rebuild and key in _INDEX_CACHE:
         return _INDEX_CACHE[key], True
+    if not rebuild:
+        disk_index = _load_index_from_disk(path=path, include_glob=include_glob)
+        if disk_index is not None:
+            _INDEX_CACHE[key] = disk_index
+            return disk_index, True
     index = _build_index(path=path, include_glob=include_glob, max_files=max_files)
     _INDEX_CACHE[key] = index
+    _save_index_to_disk(path=path, include_glob=include_glob, index=index)
     return index, False
 
 
@@ -464,6 +582,7 @@ def semantic_index_functions(
             "file_count": index.file_count,
             "function_count": index.function_count,
             "cache_hit": cache_hit,
+            "cache_path": str(_index_cache_file(path=path, include_glob=include_glob)),
         }
         return json.dumps(payload, ensure_ascii=False, indent=2)
     except Exception as exc:
@@ -1015,6 +1134,7 @@ def semantic_index_functions(
             "file_count": index.file_count,
             "function_count": index.function_count,
             "cache_hit": cache_hit,
+            "cache_path": str(_index_cache_file(path=path, include_glob=include_glob)),
             "parser_languages": parser_languages,
         }
     return _execute_tool(_handler, "semantic_index_functions")
