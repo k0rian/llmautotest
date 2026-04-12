@@ -1,0 +1,15 @@
+Generate the final delivery summary from plan and execution records.
+Respond in Chinese, including:
+- 任务结论
+- 关键证据
+- 未完成风险
+- 下一步建议
+
+Overall objective:
+{objective}
+
+Plan summary:
+{summary}
+
+Execution records:
+{execution_text}

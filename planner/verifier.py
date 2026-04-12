@@ -22,10 +22,25 @@ def verify_step_result(step_mode: StepMode, result_text: str) -> tuple[bool, str
         return False, "tool_failed"
     if step_mode == "gui_test" and "gui tool error" in lowered:
         return False, "tool_failed"
+    if step_mode == "semantic_diff" and "semantic_diff workflow failed" in lowered:
+        return False, "tool_failed"
 
     weak_markers = ("可能", "猜测", "无法确认", "not sure", "uncertain")
     if any(marker in lowered for marker in weak_markers):
         return False, "low_confidence"
+
+    if step_mode == "semantic_diff":
+        semantic_markers = (
+            "diff_result",
+            "requirement_matches",
+            "missing_requirements",
+            "summary",
+            "coverage",
+            "evidence",
+        )
+        marker_hits = sum(1 for marker in semantic_markers if marker in lowered)
+        if marker_hits < 2:
+            return False, "no_evidence"
 
     evidence_markers = ("证据", "evidence", "line ", "文件", "file", "路径", "path")
     evidence_hits = sum(1 for marker in evidence_markers if marker in lowered)
@@ -82,7 +97,7 @@ def build_replan_reason(
     completed = "\n\n".join(
         f"{step.id} | {step.title} | {step.status}\n目标: {step.objective}\n结果: {step.result}"
         for step in completed_steps
-    ) or "无"
+    ) or "N/A"
     failed_text = asdict(failed_step)
     return (
         f"总目标:\n{runtime_state.objective}\n\n"

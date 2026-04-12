@@ -2,7 +2,7 @@ from dataclasses import asdict, dataclass
 from typing import Any, Literal, TypedDict
 
 
-StepMode = Literal["code_audit", "gui_test", "analysis"]
+StepMode = Literal["code_audit", "gui_test", "analysis", "semantic_diff"]
 
 
 class AuditState(TypedDict, total=False):

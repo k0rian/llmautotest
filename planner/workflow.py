@@ -7,6 +7,7 @@ from llm_utils.config_loader import load_api_key
 from planner.finalizer import finalizer_node
 from planner.perception import perception_node
 from planner.planner import build_plan_and_execute_planner
+from planner.prompt.loader import render_txt
 from planner.policies import (
     DEFAULT_AUDIT_REQUEST,
     DEFAULT_BASE_URL,
@@ -17,6 +18,8 @@ from planner.policies import (
 )
 from planner.state import build_perception_blocked_state, format_steps, read_text
 from planner.types import AuditState
+
+PROMPT_DIR = Path(__file__).resolve().parent / "prompt"
 
 RUNTIME_IMPORT_ERROR: Exception | None = None
 try:
@@ -84,13 +87,12 @@ def planner_execute_node_factory(planner: Any):
         if isinstance(perception_meta, dict):
             hints = perception_meta.get("project_hints", {})
             if hints:
-                hint_text = f"\nPerception hints:\n{json.dumps(hints, ensure_ascii=False)}"
-        context = (
-            f"Workspace path: {workspace_path}\n"
-            "Prioritize static audit tools. If UI interaction verification is required, call gui_agent_run.\n"
-            "Any GUI conclusion must be based on tool outputs.\n\n"
-            f"Execution prompt:\n{skill_prompt}"
-            f"{hint_text}"
+                hint_text = f"\n\nPerception hints:\n{json.dumps(hints, ensure_ascii=False)}"
+        context = render_txt(
+            PROMPT_DIR / "workflow_context.txt",
+            workspace_path=workspace_path,
+            skill_prompt=skill_prompt,
+            hint_text=hint_text,
         )
 
         result = planner.invoke(
@@ -98,6 +100,7 @@ def planner_execute_node_factory(planner: Any):
                 "objective": request,
                 "context": context,
                 "max_steps": DEFAULT_MAX_STEPS,
+                "workspace_path": workspace_path,
             }
         )
         summary = read_text(result.get("summary", "")).strip()

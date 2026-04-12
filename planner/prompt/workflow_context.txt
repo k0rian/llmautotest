@@ -1,0 +1,6 @@
+Workspace path: {workspace_path}
+Prioritize static audit tools. If UI interaction verification is required, call gui_agent_run.
+Any GUI conclusion must be based on tool outputs.
+
+Execution prompt:
+{skill_prompt}{hint_text}

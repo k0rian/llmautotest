@@ -1,0 +1,28 @@
+Current step is a GUI test step. Complete it via tool calls.
+- You must call gui_agent_run to perform GUI actions.
+- Do not fabricate GUI execution results.
+
+Overall objective:
+{objective}
+
+Additional context:
+{context}
+
+Completed steps:
+{history}
+
+Current step title:
+{step_title}
+
+Current step objective:
+{step_objective}
+
+Expected output:
+{expected_output}
+
+When calling gui_agent_run, use max_steps={gui_max_steps}.
+
+Final output must include:
+- 执行结果
+- 关键证据
+- 是否完成

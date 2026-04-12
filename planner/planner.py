@@ -1,13 +1,15 @@
 import json
 import re
 from dataclasses import asdict
+from pathlib import Path
 from typing import Any
 
 from langchain.agents import create_agent
 from langchain_openai import ChatOpenAI
 
 from llm_utils.config_loader import load_api_key
-from planner.policies import DEFAULT_BASE_URL, DEFAULT_MODEL_NAME, DEFAULT_MAX_REPLANS
+from planner.policies import DEFAULT_BASE_URL, DEFAULT_MODEL_NAME
+from planner.prompt.loader import render_txt
 from planner.state import (
     advance_step,
     append_evidence,
@@ -29,7 +31,10 @@ from planner.verifier import (
     verify_step_result,
 )
 from tools.description.description import TOOL_DESCRIPTIONS
+from tools.semantic_diff import semantic_diff_with_description, semantic_index_functions
 from tools.tools import build_tools
+
+PROMPT_DIR = Path(__file__).resolve().parent / "prompt"
 
 
 def build_planner_model(
@@ -87,7 +92,7 @@ def _extract_evidence_items(step: PlanStep, text: str) -> list[EvidenceItem]:
         return []
     confidence = 0.6
     lowered = normalized.lower()
-    if "line " in lowered or "file" in lowered or "证据" in normalized:
+    if "line " in lowered or "file" in lowered or "evidence" in lowered:
         confidence = 0.8
     return [
         EvidenceItem(
@@ -98,6 +103,10 @@ def _extract_evidence_items(step: PlanStep, text: str) -> list[EvidenceItem]:
             confidence=confidence,
         )
     ]
+
+
+def _render_prompt(template_name: str, **kwargs: object) -> str:
+    return render_txt(PROMPT_DIR / template_name, **kwargs)
 
 
 class PlanAndExecutePlanner:
@@ -129,23 +138,21 @@ class PlanAndExecutePlanner:
         )
         context = read_text(inputs.get("context", ""))
         max_steps = inputs.get("max_steps")
-        result = self.execute(objective=objective, context=context, max_steps=max_steps)
+        workspace_path = read_text(inputs.get("workspace_path", "")).strip()
+        result = self.execute(
+            objective=objective,
+            context=context,
+            max_steps=max_steps,
+            workspace_path=workspace_path,
+        )
         return result.to_dict()
 
     def create_plan(self, objective: str, context: str = "") -> tuple[str, list[PlanStep]]:
-        prompt = (
-            "你是一个面向代码审计与 GUI 功能测试的任务规划器。"
-            "请根据用户目标输出一个可执行计划。"
-            "步骤数量控制在 1 到 6 步，每步必须足够原子。"
-            "mode 只能是 code_audit、gui_test、analysis 之一。"
-            "如果任务涉及代码阅读、静态分析、LSP、文件搜索，优先使用 code_audit。"
-            "如果任务涉及界面点击、输入、截图验证，使用 gui_test。"
-            "如果任务是汇总、判断、整合结论，使用 analysis。"
-            "只返回 JSON，不要使用 markdown。"
-            'JSON 格式为 {"summary":"...","steps":[{"title":"...","mode":"code_audit","objective":"...","expected_output":"..."}]}。'
-            f"\n\n可用工具摘要：\n{_tool_description_text()}"
-            f"\n\n用户目标：\n{objective}"
-            f"\n\n补充上下文：\n{context or '无'}"
+        prompt = _render_prompt(
+            "create_plan.txt",
+            tool_descriptions=_tool_description_text(),
+            objective=objective,
+            context=context or "N/A",
         )
         raw = _extract_text(self.planner_model.invoke(prompt))
         try:
@@ -168,7 +175,13 @@ class PlanAndExecutePlanner:
             ]
             return "执行任务规划", fallback
 
-    def execute(self, objective: str, context: str = "", max_steps: int | None = None) -> PlannerRunResult:
+    def execute(
+        self,
+        objective: str,
+        context: str = "",
+        max_steps: int | None = None,
+        workspace_path: str = "",
+    ) -> PlannerRunResult:
         if not objective or not objective.strip():
             empty_state = create_runtime_state(objective="", context=context, summary="", steps=[])
             empty_state.status = "failed"
@@ -206,6 +219,7 @@ class PlanAndExecutePlanner:
                 step=step,
                 history=runtime_state.steps[: runtime_state.current_step_index],
                 runtime_state=runtime_state,
+                workspace_path=workspace_path,
             )
             append_tool_record(runtime_state, tool_record)
             verified, reason = verify_step_result(step.mode, result_text)
@@ -262,6 +276,7 @@ class PlanAndExecutePlanner:
         step: PlanStep,
         history: list[PlanStep],
         runtime_state: PlannerRuntimeState,
+        workspace_path: str = "",
     ) -> tuple[str, ToolExecutionRecord]:
         tool_id = f"tool-{len(runtime_state.tool_history or []) + 1}"
         if step.mode == "gui_test":
@@ -271,13 +286,32 @@ class PlanAndExecutePlanner:
                 step=step,
                 history=history,
             )
+            lowered = text.lower()
             return text, ToolExecutionRecord(
                 id=tool_id,
                 step_id=step.id,
                 tool_name="executor_agent(gui)",
                 input_summary=f"{step.mode}:{step.objective[:120]}",
                 output_summary=text[:200],
-                success="failed" not in text.lower() and "timeout" not in text.lower(),
+                success="failed" not in lowered and "timeout" not in lowered and "error" not in lowered,
+            )
+
+        if step.mode == "semantic_diff":
+            text = self._execute_semantic_diff_step(
+                objective=objective,
+                context=context,
+                step=step,
+                history=history,
+                workspace_path=workspace_path,
+            )
+            lowered = text.lower()
+            return text, ToolExecutionRecord(
+                id=tool_id,
+                step_id=step.id,
+                tool_name="executor_agent(semantic_diff)",
+                input_summary=f"{step.mode}:{step.objective[:120]}",
+                output_summary=text[:200],
+                success="failed" not in lowered and "timeout" not in lowered and "error" not in lowered,
             )
 
         prompt = self._build_execution_prompt(
@@ -332,19 +366,14 @@ class PlanAndExecutePlanner:
             reason=reason,
         )
         failed_text = json.dumps(asdict(failed_step), ensure_ascii=False, indent=2)
-        prompt = (
-            "你需要基于已经完成的步骤和失败信息重新规划剩余步骤。"
-            "不要重复已完成步骤，只输出剩余步骤。"
-            "mode 只能是 code_audit、gui_test、analysis。"
-            "步骤数量控制在 1 到 4 步。"
-            "只返回 JSON，不要使用 markdown。"
-            'JSON 格式为 {"steps":[{"title":"...","mode":"code_audit","objective":"...","expected_output":"..."}]}。'
-            f"\n\n总目标：\n{state.objective}"
-            f"\n\n规划摘要：\n{state.plan_summary}"
-            f"\n\n上下文：\n{state.context or '无'}"
-            f"\n\n已完成步骤：\n{completed_text or '无'}"
-            f"\n\n失败信息摘要：\n{failure_reason}"
-            f"\n\n失败步骤：\n{failed_text}"
+        prompt = _render_prompt(
+            "replan.txt",
+            objective=state.objective,
+            plan_summary=state.plan_summary,
+            context=state.context or "N/A",
+            completed_text=completed_text or "N/A",
+            failure_reason=failure_reason,
+            failed_step=failed_text,
         )
         try:
             raw = _extract_text(self.planner_model.invoke(prompt))
@@ -357,12 +386,11 @@ class PlanAndExecutePlanner:
         execution_text = "\n\n".join(
             json.dumps(asdict(step), ensure_ascii=False, indent=2) for step in steps
         )
-        prompt = (
-            "请根据规划与执行记录，生成最终交付结论。"
-            "输出使用中文，包含任务结论、关键证据、未完成风险、下一步建议。"
-            f"\n\n总目标：\n{objective}"
-            f"\n\n规划摘要：\n{summary}"
-            f"\n\n执行记录：\n{execution_text or '无'}"
+        prompt = _render_prompt(
+            "summarize_execution.txt",
+            objective=objective,
+            summary=summary,
+            execution_text=execution_text or "N/A",
         )
         try:
             return _extract_text(self.planner_model.invoke(prompt)).strip()
@@ -373,19 +401,23 @@ class PlanAndExecutePlanner:
         steps: list[PlanStep] = []
         if not isinstance(steps_data, list):
             return steps
+        valid_modes = {"code_audit", "gui_test", "analysis", "semantic_diff"}
         for idx, item in enumerate(steps_data, start=1):
             if not isinstance(item, dict):
                 continue
             mode = read_text(item.get("mode", "code_audit")).strip() or "code_audit"
-            if mode not in {"code_audit", "gui_test", "analysis"}:
+            if mode not in valid_modes:
                 mode = "code_audit"
+            title = read_text(item.get("title", f"步骤 {idx}")).strip() or f"步骤 {idx}"
+            objective = read_text(item.get("objective", "")).strip() or title
+            expected_output = read_text(item.get("expected_output", "")).strip() or "返回本步骤结果"
             steps.append(
                 PlanStep(
                     id=f"step-{idx}",
-                    title=read_text(item.get("title", f"步骤 {idx}")).strip() or f"步骤 {idx}",
+                    title=title,
                     mode=mode,
-                    objective=read_text(item.get("objective", "")).strip() or read_text(item.get("title", f"步骤 {idx}")),
-                    expected_output=read_text(item.get("expected_output", "")).strip() or "返回本步骤结果",
+                    objective=objective,
+                    expected_output=expected_output,
                 )
             )
         return steps
@@ -397,19 +429,15 @@ class PlanAndExecutePlanner:
         step: PlanStep,
         history: list[PlanStep],
     ) -> str:
-        return (
-            "你是执行代理，需要完成当前规划步骤。"
-            "优先使用已有工具获取证据，不要空想。"
-            "如果当前步骤无法完成，请明确说明阻塞点。"
-            "输出使用中文。"
-            f"\n\n总目标：\n{objective}"
-            f"\n\n补充上下文：\n{context or '无'}"
-            f"\n\n已完成步骤：\n{self._history_text(history) or '无'}"
-            f"\n\n当前步骤标题：\n{step.title}"
-            f"\n\n当前步骤模式：\n{step.mode}"
-            f"\n\n当前步骤目标：\n{step.objective}"
-            f"\n\n期望输出：\n{step.expected_output}"
-            "\n\n请给出：\n1. 本步执行结果\n2. 关键证据\n3. 对总任务的影响"
+        return _render_prompt(
+            "execute_step.txt",
+            objective=objective,
+            context=context or "N/A",
+            history=self._history_text(history) or "N/A",
+            step_title=step.title,
+            step_mode=step.mode,
+            step_objective=step.objective,
+            expected_output=step.expected_output,
         )
 
     def _history_text(self, history: list[PlanStep]) -> str:
@@ -427,18 +455,15 @@ class PlanAndExecutePlanner:
         step: PlanStep,
         history: list[PlanStep],
     ) -> str:
-        history_text = self._history_text(history) or "无"
-        prompt = (
-            "当前是 GUI 测试步骤，请通过工具调用完成任务。\n"
-            "必须调用 gui_agent_run 工具执行 GUI 操作，不要假设执行结果。\n"
-            f"总目标:\n{objective}\n\n"
-            f"补充上下文:\n{context or '无'}\n\n"
-            f"已完成步骤:\n{history_text}\n\n"
-            f"当前步骤标题:\n{step.title}\n\n"
-            f"当前步骤目标:\n{step.objective}\n\n"
-            f"期望输出:\n{step.expected_output}\n\n"
-            f"调用 gui_agent_run 时请使用 max_steps={self.gui_max_steps}。\n"
-            "最后请输出：执行结果、关键证据、是否完成。"
+        prompt = _render_prompt(
+            "execute_gui_step.txt",
+            objective=objective,
+            context=context or "N/A",
+            history=self._history_text(history) or "N/A",
+            step_title=step.title,
+            step_objective=step.objective,
+            expected_output=step.expected_output,
+            gui_max_steps=self.gui_max_steps,
         )
         response = self.executor_agent.invoke(
             {
@@ -451,6 +476,70 @@ class PlanAndExecutePlanner:
             }
         )
         return _extract_text(response).strip()
+
+    def _execute_semantic_diff_step(
+        self,
+        objective: str,
+        context: str,
+        step: PlanStep,
+        history: list[PlanStep],
+        workspace_path: str,
+    ) -> str:
+        resolved_workspace = workspace_path.strip() or self._extract_workspace_path_from_context(context)
+        if not resolved_workspace:
+            return "semantic_diff workflow failed: workspace path is empty"
+
+        description = self._build_semantic_description(
+            objective=objective,
+            context=context,
+            step=step,
+            history=history,
+        )
+        try:
+            index_result = semantic_index_functions(path=resolved_workspace, rebuild=False)
+            diff_result = semantic_diff_with_description(
+                path=resolved_workspace,
+                description=description,
+                rebuild=False,
+            )
+            return (
+                "semantic_diff workflow result\n"
+                f"workspace: {resolved_workspace}\n\n"
+                f"index_result:\n{read_text(index_result).strip()}\n\n"
+                f"diff_result:\n{read_text(diff_result).strip()}"
+            )
+        except Exception as exc:
+            return f"semantic_diff workflow failed: {exc}"
+
+    def _extract_workspace_path_from_context(self, context: str) -> str:
+        text = context or ""
+        patterns = (
+            r"^Workspace path:\s*(.+)$",
+            r"^workspace_path:\s*(.+)$",
+            r"^工作区路径[:：]\s*(.+)$",
+        )
+        for pattern in patterns:
+            match = re.search(pattern, text, flags=re.IGNORECASE | re.MULTILINE)
+            if match:
+                return match.group(1).strip()
+        return ""
+
+    def _build_semantic_description(
+        self,
+        objective: str,
+        context: str,
+        step: PlanStep,
+        history: list[PlanStep],
+    ) -> str:
+        return _render_prompt(
+            "semantic_diff_description.txt",
+            objective=objective,
+            step_title=step.title,
+            step_objective=step.objective,
+            expected_output=step.expected_output,
+            context=context or "N/A",
+            history=self._history_text(history) or "N/A",
+        )
 
 
 def build_plan_and_execute_planner(
