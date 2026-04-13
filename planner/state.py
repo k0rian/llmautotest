@@ -82,6 +82,7 @@ def create_runtime_state(
         latest_failure_category="",
         semantic_required=semantic_required,
         semantic_target_hint=semantic_target_hint,
+        semantic_context={},
         status="running",
     )
 

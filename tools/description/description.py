@@ -51,6 +51,30 @@ TOOL_DESCRIPTIONS = {
         "category": "semantic",
         "description": "- Compare implementation with user description (PRD/API docs)\n- Generates coverage summary: covered/partial/missing requirements\n- Also lists potentially undocumented functions",
     },
+    "build_hierarchical_code_index": {
+        "category": "semantic",
+        "description": "- Build hierarchical semantic index from function/file/directory/repository levels\n- Supports cache reuse and incremental update by file content hash\n- Returns index stats and cache path for downstream localization/retrieval",
+    },
+    "semantic_localize_requirement": {
+        "category": "semantic",
+        "description": "- Localize requirement in top-down order: repository -> directory -> file -> function\n- Returns scored candidates with reasons for each hit",
+    },
+    "query_symbol_definition": {
+        "category": "semantic",
+        "description": "- Query symbol definition candidates from semantic index\n- Returns file path, line range, signature, and source summary evidence",
+    },
+    "query_callee_functions": {
+        "category": "semantic",
+        "description": "- Query direct callee functions of a target function\n- Returns caller-callee evidence with file paths and line ranges",
+    },
+    "query_caller_functions": {
+        "category": "semantic",
+        "description": "- Query direct caller functions of a target function\n- Returns caller evidence with file paths and line ranges",
+    },
+    "validate_semantic_finding": {
+        "category": "semantic",
+        "description": "- Validate preliminary semantic finding using evidence bundle\n- Distinguishes true missing/partial coverage/naming misleading/insufficient evidence",
+    },
     "lsp_start_session": {"category": "lsp", "description": "- Start and initialize an LSP session for a workspace"},
     "lsp_stop_session": {"category": "lsp", "description": "- Stop an LSP session and release resources"},
     "lsp_list_sessions": {"category": "lsp", "description": "- List current LSP sessions and status"},

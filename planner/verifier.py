@@ -17,24 +17,42 @@ def verify_step_result(
     if step_mode == "invalid":
         return False, "invalid_mode"
 
-    if step_mode == "semantic_diff" and isinstance(structured_output, dict):
+    if step_mode in {"semantic_diff", "semantic_index", "semantic_localize", "semantic_retrieve", "semantic_validate"} and isinstance(structured_output, dict):
         error_stage = str(structured_output.get("error_stage", "")).strip().lower()
         if error_stage == "scope_invalid":
             return False, "scope_invalid"
         if error_stage in {"index", "diff", "tool_failed"}:
             return False, "tool_failed"
 
-        index_success = bool(structured_output.get("index_success", False))
-        diff_success = bool(structured_output.get("diff_success", False))
-        if not (index_success and diff_success):
-            return False, "tool_failed"
+        if step_mode == "semantic_diff":
+            index_success = bool(structured_output.get("index_success", False))
+            diff_success = bool(structured_output.get("diff_success", False))
+            if not (index_success and diff_success):
+                return False, "tool_failed"
 
-        matched_count = int(structured_output.get("matched_count", 0) or 0)
-        missing_count = int(structured_output.get("missing_count", 0) or 0)
-        evidence_paths = structured_output.get("evidence_paths", [])
-        evidence_count = len(evidence_paths) if isinstance(evidence_paths, list) else 0
-        if matched_count + missing_count <= 0 and evidence_count <= 0:
-            return False, "no_evidence"
+            matched_count = int(structured_output.get("matched_count", 0) or 0)
+            missing_count = int(structured_output.get("missing_count", 0) or 0)
+            evidence_paths = structured_output.get("evidence_paths", [])
+            evidence_count = len(evidence_paths) if isinstance(evidence_paths, list) else 0
+            if matched_count + missing_count <= 0 and evidence_count <= 0:
+                return False, "no_evidence"
+        else:
+            stage = str(structured_output.get("stage", "")).strip().lower()
+            if not stage:
+                return False, "no_evidence"
+            evidence = structured_output.get("evidence", [])
+            localized = structured_output.get("localized_candidates", {})
+            retrieved = structured_output.get("retrieved_contexts", [])
+            has_localized = isinstance(localized, dict) and any(
+                isinstance(localized.get(key), list) and localized.get(key)
+                for key in ("directories", "files", "functions")
+            )
+            has_evidence = isinstance(evidence, list) and len(evidence) > 0
+            has_retrieved = isinstance(retrieved, list) and len(retrieved) > 0
+            if step_mode in {"semantic_retrieve", "semantic_validate"} and not (has_evidence or has_retrieved):
+                return False, "no_evidence"
+            if step_mode == "semantic_localize" and not has_localized:
+                return False, "no_evidence"
         return True, "ok"
 
     failed_markers = (

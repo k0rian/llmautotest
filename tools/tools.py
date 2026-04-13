@@ -16,6 +16,14 @@ from tools.semantic_diff_ts import (
     semantic_index_functions,
     semantic_search_functions,
 )
+from tools.code_index import build_hierarchical_code_index
+from tools.code_localization import semantic_localize_requirement
+from tools.code_retrieval import (
+    query_callee_functions,
+    query_caller_functions,
+    query_symbol_definition,
+    validate_semantic_finding,
+)
 from tools.lsp import (
     lsp_change_document,
     lsp_close_document,
@@ -58,6 +66,12 @@ def _tool_registry() -> dict[str, Any]:
         "semantic_index_functions": semantic_index_functions,
         "semantic_search_functions": semantic_search_functions,
         "semantic_diff_with_description": semantic_diff_with_description,
+        "build_hierarchical_code_index": build_hierarchical_code_index,
+        "semantic_localize_requirement": semantic_localize_requirement,
+        "query_symbol_definition": query_symbol_definition,
+        "query_callee_functions": query_callee_functions,
+        "query_caller_functions": query_caller_functions,
+        "validate_semantic_finding": validate_semantic_finding,
         "lsp_start_session": lsp_start_session,
         "lsp_stop_session": lsp_stop_session,
         "lsp_list_sessions": lsp_list_sessions,

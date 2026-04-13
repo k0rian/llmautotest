@@ -1,7 +1,7 @@
 import json
 import re
 from dataclasses import asdict
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -32,6 +32,7 @@ from planner.verifier import (
     should_trigger_replan,
     verify_step_result,
 )
+from planner.semantic_agent import SemanticAgent
 from tools.description.description import TOOL_DESCRIPTIONS
 from tools.core import WorkspaceGuard
 from tools.semantic_diff_ts import semantic_diff_with_description, semantic_index_functions
@@ -40,8 +41,13 @@ from tools.tools import build_tools
 PROMPT_DIR = Path(__file__).resolve().parent / "prompt"
 SEMANTIC_MODE_ALIASES = {
     "semantic_analysis": "semantic_diff",
-    "semantic_index": "semantic_diff",
-    "semantic-index": "semantic_diff",
+    "semantic-index": "semantic_index",
+    "semantic_localization": "semantic_localize",
+    "semantic-localize": "semantic_localize",
+    "semantic-retrieve": "semantic_retrieve",
+    "semantic-retrieval": "semantic_retrieve",
+    "semantic-validation": "semantic_validate",
+    "semantic-validate": "semantic_validate",
     "semanticdiff": "semantic_diff",
     "semantic diff": "semantic_diff",
 }
@@ -144,6 +150,7 @@ class PlanAndExecutePlanner:
         self.planner_model = planner_model or build_planner_model()
         self.executor_agent = executor_agent or build_executor_agent(self.planner_model, verbose=verbose)
         self.gui_executor = gui_executor
+        self.semantic_agent = SemanticAgent()
         self.max_replans = max(0, int(max_replans))
         self.gui_max_steps = max(1, int(gui_max_steps))
 
@@ -297,10 +304,13 @@ class PlanAndExecutePlanner:
                 if replan_parse_failed:
                     record_failure_category(runtime_state, "replan_parse_failed")
                     append_open_question(runtime_state, "replan_parse_failed: fallback to deterministic semantic step")
-                    if runtime_state.semantic_required and not self._has_completed_semantic_step(runtime_state):
+                    if runtime_state.semantic_required:
                         fallback_target = step.target_path or runtime_state.semantic_target_hint
                         runtime_state.steps = runtime_state.steps[: runtime_state.current_step_index] + [
-                            self._build_forced_semantic_step(target_hint=fallback_target)
+                            self._build_forced_semantic_pipeline_step(mode="semantic_index", target_hint=fallback_target),
+                            self._build_forced_semantic_pipeline_step(mode="semantic_localize", target_hint=fallback_target),
+                            self._build_forced_semantic_pipeline_step(mode="semantic_retrieve", target_hint=fallback_target),
+                            self._build_forced_semantic_pipeline_step(mode="semantic_validate", target_hint=fallback_target),
                         ]
                         continue
                 if remaining:
@@ -378,6 +388,25 @@ class PlanAndExecutePlanner:
                     and "error" not in lowered
                     and error_stage not in {"index", "diff", "scope_invalid"}
                 ),
+                structured_output=structured_output,
+            )
+
+        if step.mode in {"semantic_index", "semantic_localize", "semantic_retrieve", "semantic_validate"}:
+            text, structured_output = self._execute_semantic_pipeline_step(
+                objective=objective,
+                context=context,
+                step=step,
+                runtime_state=runtime_state,
+                workspace_path=workspace_path,
+            )
+            lowered = text.lower()
+            return text, ToolExecutionRecord(
+                id=tool_id,
+                step_id=step.id,
+                tool_name=f"executor_agent({step.mode})",
+                input_summary=f"{step.mode}:{step.objective[:120]}",
+                output_summary=text[:200],
+                success=("failed" not in lowered and "error" not in lowered),
                 structured_output=structured_output,
             )
 
@@ -482,7 +511,16 @@ class PlanAndExecutePlanner:
         steps: list[PlanStep] = []
         if not isinstance(steps_data, list):
             return steps
-        valid_modes = {"code_audit", "gui_test", "analysis", "semantic_diff"}
+        valid_modes = {
+            "code_audit",
+            "gui_test",
+            "analysis",
+            "semantic_diff",
+            "semantic_index",
+            "semantic_localize",
+            "semantic_retrieve",
+            "semantic_validate",
+        }
         for idx, item in enumerate(steps_data, start=1):
             if not isinstance(item, dict):
                 continue
@@ -515,17 +553,20 @@ class PlanAndExecutePlanner:
     ) -> list[PlanStep]:
         if not semantic_required:
             return self._reindex_steps(steps)
-        if not steps:
-            return self._reindex_steps([self._build_forced_semantic_step(target_hint=target_hint)])
-
-        semantic_indices = [idx for idx, step in enumerate(steps) if step.mode == "semantic_diff"]
-        if not semantic_indices:
-            steps.insert(0, self._build_forced_semantic_step(target_hint=target_hint))
-            return self._reindex_steps(steps)
-
-        if semantic_indices[0] > 1:
-            semantic_step = steps.pop(semantic_indices[0])
-            steps.insert(1, semantic_step)
+        required_modes = ["semantic_index", "semantic_localize", "semantic_retrieve", "semantic_validate"]
+        existing_modes = [step.mode for step in steps]
+        for mode in reversed(required_modes):
+            if mode in existing_modes:
+                continue
+            steps.insert(0, self._build_forced_semantic_pipeline_step(mode=mode, target_hint=target_hint))
+        first_semantic = next(
+            (idx for idx, step in enumerate(steps) if step.mode in set(required_modes) | {"semantic_diff"}),
+            0,
+        )
+        if first_semantic > 1:
+            semantic_block = [step for step in steps if step.mode in set(required_modes) | {"semantic_diff"}]
+            non_semantic = [step for step in steps if step.mode not in set(required_modes) | {"semantic_diff"}]
+            steps = non_semantic[:1] + semantic_block + non_semantic[1:]
         return self._reindex_steps(steps)
 
     def _reindex_steps(self, steps: list[PlanStep]) -> list[PlanStep]:
@@ -546,8 +587,40 @@ class PlanAndExecutePlanner:
             raw_mode="semantic_diff",
         )
 
+    def _build_forced_semantic_pipeline_step(self, mode: str, target_hint: str = "") -> PlanStep:
+        title_map = {
+            "semantic_index": "Build hierarchical semantic index",
+            "semantic_localize": "Localize requirement with hierarchical index",
+            "semantic_retrieve": "Retrieve symbol/graph context for unknown findings",
+            "semantic_validate": "Validate semantic findings and classify confidence",
+        }
+        objective_map = {
+            "semantic_index": "Build repository -> directory -> file -> function semantic index with cache support.",
+            "semantic_localize": "Localize requirement to top directories/files/functions with score and reasons.",
+            "semantic_retrieve": "When evidence is insufficient, retrieve definition/caller/callee context and re-detect.",
+            "semantic_validate": "Validate preliminary semantic findings and output structured decision and confidence.",
+        }
+        return PlanStep(
+            id=f"step-forced-{mode}",
+            title=title_map.get(mode, mode),
+            mode=mode,  # type: ignore[arg-type]
+            objective=objective_map.get(mode, mode),
+            expected_output=(
+                "Must include requirement, localized_candidates, retrieved_contexts, decision, confidence, evidence."
+            ),
+            target_path=target_hint.strip(),
+            raw_mode=mode,
+        )
+
     def _has_completed_semantic_step(self, state: PlannerRuntimeState) -> bool:
-        return any(step.mode == "semantic_diff" and step.status == "completed" for step in state.steps)
+        semantic_modes = {
+            "semantic_diff",
+            "semantic_index",
+            "semantic_localize",
+            "semantic_retrieve",
+            "semantic_validate",
+        }
+        return any(step.mode in semantic_modes and step.status == "completed" for step in state.steps)
 
     def _map_failure_category(self, reason: str) -> str:
         token = (reason or "").strip().lower()
@@ -721,6 +794,83 @@ class PlanAndExecutePlanner:
                 },
             )
 
+    def _execute_semantic_pipeline_step(
+        self,
+        objective: str,
+        context: str,
+        step: PlanStep,
+        runtime_state: PlannerRuntimeState,
+        workspace_path: str,
+    ) -> tuple[str, dict[str, Any]]:
+        resolved_workspace = workspace_path.strip() or self._extract_workspace_path_from_context(context)
+        if not resolved_workspace:
+            return (
+                f"{step.mode} workflow failed: workspace path is empty",
+                {
+                    "stage": step.mode,
+                    "error_stage": "scope_invalid",
+                    "decision": "unknown",
+                    "confidence": 0.0,
+                    "requirement": step.objective,
+                    "localized_candidates": {},
+                    "retrieved_contexts": [],
+                    "evidence": [],
+                    "missing_requirements": [],
+                    "covered_requirements": [],
+                    "partial_requirements": [],
+                },
+            )
+
+        target_path, scope_error = self._resolve_semantic_target_path(
+            workspace_path=resolved_workspace,
+            target_path=step.target_path,
+            objective=step.objective,
+            context=context,
+        )
+        if scope_error:
+            return (
+                f"{step.mode} workflow failed: {scope_error}",
+                {
+                    "stage": step.mode,
+                    "error_stage": "scope_invalid",
+                    "decision": "unknown",
+                    "confidence": 0.0,
+                    "requirement": step.objective,
+                    "localized_candidates": {},
+                    "retrieved_contexts": [],
+                    "evidence": [],
+                    "missing_requirements": [],
+                    "covered_requirements": [],
+                    "partial_requirements": [],
+                },
+            )
+        try:
+            return self.semantic_agent.execute_step(
+                mode=step.mode,
+                objective=objective,
+                step=step,
+                runtime_state=runtime_state,
+                workspace_path=resolved_workspace,
+                target_path=target_path,
+            )
+        except Exception as exc:
+            return (
+                f"{step.mode} workflow failed: {exc}",
+                {
+                    "stage": step.mode,
+                    "error_stage": "tool_failed",
+                    "decision": "unknown",
+                    "confidence": 0.0,
+                    "requirement": step.objective,
+                    "localized_candidates": {},
+                    "retrieved_contexts": [],
+                    "evidence": [],
+                    "missing_requirements": [],
+                    "covered_requirements": [],
+                    "partial_requirements": [],
+                },
+            )
+
     def _resolve_semantic_target_path(
         self,
         workspace_path: str,
@@ -852,7 +1002,7 @@ class PlanAndExecutePlanner:
         diff_data: dict[str, Any],
     ) -> dict[str, str]:
         base_dir = Path(workspace_path) / ".llmautotest" / "semantic_runs"
-        stamp = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         run_dir = base_dir / f"{stamp}_{step.id}"
         run_dir.mkdir(parents=True, exist_ok=True)
 

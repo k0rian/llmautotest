@@ -114,7 +114,7 @@ def planner_execute_node_factory(planner: Any):
             fallback_guidance = (
                 "\n\nExecution fallback:\n"
                 "- LSP is unavailable, do not rely on LSP tools.\n"
-                "- Must include a semantic_diff step that runs semantic_index_functions + semantic_diff_with_description.\n"
+                "- Must include semantic pipeline steps: semantic_index -> semantic_localize -> semantic_retrieve -> semantic_validate.\n"
                 "- Must include at least one code_audit step focused on file_search/grep_search/read_file evidence collection.\n"
                 f"- Fallback reason: {fallback_reason}"
             )
@@ -122,7 +122,7 @@ def planner_execute_node_factory(planner: Any):
             semantic_intent_guidance = (
                 "\n\nSemantic-intent directive:\n"
                 "- The request appears to require semantic index based analysis.\n"
-                "- Plan must include semantic_diff mode early and use it as a primary evidence source."
+                "- Plan must include semantic pipeline modes early and use them as primary evidence sources."
             )
 
         effective_request = request
@@ -130,7 +130,7 @@ def planner_execute_node_factory(planner: Any):
             effective_request = (
                 f"{request}\n\n"
                 "[Planner directives]\n"
-                f"{'1) Must include semantic_diff step.\n' if (semantic_fallback or semantic_intent) else ''}"
+                f"{'1) Must include semantic_index + semantic_localize + semantic_retrieve + semantic_validate steps.\n' if (semantic_fallback or semantic_intent) else ''}"
                 f"{'2) Must include file search based code_audit step.\n' if semantic_fallback else ''}"
             )
 

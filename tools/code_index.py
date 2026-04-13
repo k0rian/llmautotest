@@ -1,0 +1,333 @@
+﻿import hashlib
+import json
+from collections import defaultdict
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+from langchain.tools import tool
+
+from tools import semantic_diff_ts as semantic_mod
+
+INDEX_VERSION = 2
+HIER_PREFIX = "hierarchical"
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _sha1_text(text: str) -> str:
+    return hashlib.sha1(text.encode("utf-8", errors="ignore")).hexdigest()
+
+
+def _node_id(kind: str, path: str, name: str = "", extra: str = "") -> str:
+    digest = _sha1_text(f"{kind}|{path}|{name}|{extra}")
+    return f"{kind}:{digest[:16]}"
+
+
+def _cache_file(path: str, include_glob: str) -> Path:
+    root = Path(path).resolve()
+    cache_dir = root / semantic_mod.INDEX_CACHE_DIRNAME / semantic_mod.INDEX_CACHE_SUBDIR
+    digest = _sha1_text(f"{HIER_PREFIX}|{root}|{include_glob.lower()}")
+    return cache_dir / f"{digest}.hier.json"
+
+
+def _safe_read_json(path: Path) -> dict[str, Any]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _deterministic_function_summary(item: dict[str, Any]) -> str:
+    name = str(item.get("name", "")).strip()
+    signature = str(item.get("signature", "")).strip()
+    doc = str(item.get("doc", "")).strip()
+    source = str(item.get("source", "")).strip()
+    if doc:
+        return f"{name}: {doc.splitlines()[0][:160]}"
+    first_line = source.splitlines()[0].strip() if source else ""
+    return f"{name} {signature}".strip() + (f" | {first_line[:120]}" if first_line else "")
+
+
+def _aggregate_summary(items: list[str], fallback: str) -> str:
+    cleaned = [value.strip() for value in items if value and value.strip()]
+    if not cleaned:
+        return fallback
+    merged = " | ".join(cleaned[:5])
+    return merged[:600]
+
+
+def _compute_file_hash(path: Path) -> str:
+    try:
+        data = path.read_bytes()
+    except Exception:
+        return ""
+    return hashlib.sha1(data).hexdigest()
+
+
+def _extract_functions_for_file(file_path: Path) -> list[dict[str, Any]]:
+    try:
+        return semantic_mod._extract_functions(file_path)
+    except Exception:
+        return []
+
+
+def _build_hierarchical_index_payload(
+    path: str,
+    rebuild: bool,
+    use_llm: bool,
+    include_glob: str,
+    max_files: int,
+) -> dict[str, Any]:
+    del use_llm  # reserved for future P2 upgrade
+    root = Path(path).resolve()
+    if not root.exists() or not root.is_dir():
+        raise ValueError(f"invalid directory path '{path}'")
+
+    files = semantic_mod._iter_code_files(root=root, include_glob=include_glob, max_files=max_files)
+    old_cache_path = _cache_file(str(root), include_glob)
+    previous = _safe_read_json(old_cache_path) if old_cache_path.exists() and not rebuild else {}
+    previous_nodes = previous.get("nodes", {}) if isinstance(previous.get("nodes", {}), dict) else {}
+    previous_meta = previous.get("artifacts", {}) if isinstance(previous.get("artifacts", {}), dict) else {}
+    previous_file_hashes = (
+        previous_meta.get("file_hashes", {}) if isinstance(previous_meta.get("file_hashes", {}), dict) else {}
+    )
+
+    nodes: dict[str, dict[str, Any]] = {}
+    edges: list[dict[str, str]] = []
+    file_to_functions: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    file_hashes: dict[str, str] = {}
+
+    reused_file_count = 0
+    rebuilt_file_count = 0
+
+    for file_path in files:
+        file_abs = str(file_path.resolve())
+        file_hash = _compute_file_hash(file_path)
+        file_hashes[file_abs] = file_hash
+        unchanged = (
+            not rebuild
+            and file_hash
+            and str(previous_file_hashes.get(file_abs, "")) == file_hash
+        )
+        if unchanged:
+            reused_file_count += 1
+            # Reuse function nodes for this file from previous cache.
+            for node in previous_nodes.values():
+                if not isinstance(node, dict):
+                    continue
+                if node.get("kind") != "function":
+                    continue
+                if str(node.get("path", "")) != file_abs:
+                    continue
+                file_to_functions[file_abs].append(node)
+            continue
+
+        rebuilt_file_count += 1
+        raw_functions = _extract_functions_for_file(file_path)
+        for item in raw_functions:
+            node_hash = _sha1_text(
+                "|".join(
+                    [
+                        str(item.get("file", "")),
+                        str(item.get("name", "")),
+                        str(item.get("start_line", "")),
+                        str(item.get("signature", "")),
+                        str(item.get("doc", "")),
+                        str(item.get("source", "")),
+                    ]
+                )
+            )
+            node = {
+                "id": _node_id(
+                    "function",
+                    str(item.get("file", "")),
+                    str(item.get("name", "")),
+                    str(item.get("start_line", "")),
+                ),
+                "kind": "function",
+                "path": str(item.get("file", "")),
+                "name": str(item.get("name", "")),
+                "summary": _deterministic_function_summary(item),
+                "children": [],
+                "language": str(item.get("language", "unknown")),
+                "symbol_count": 1,
+                "last_updated": _utc_now(),
+                "hash": node_hash,
+                "line_range": [int(item.get("start_line", 0) or 0), int(item.get("end_line", 0) or 0)],
+                "signature": str(item.get("signature", "")),
+                "source_summary": str(item.get("source", ""))[:280],
+            }
+            file_to_functions[file_abs].append(node)
+
+    # Write function nodes into node table first.
+    for function_nodes in file_to_functions.values():
+        for fn in function_nodes:
+            nodes[str(fn["id"])] = fn
+
+    file_node_ids: list[str] = []
+    dir_children: dict[str, list[str]] = defaultdict(list)
+
+    for file_path in files:
+        file_abs = str(file_path.resolve())
+        function_nodes = file_to_functions.get(file_abs, [])
+        child_ids = [str(item["id"]) for item in function_nodes]
+        file_summary = _aggregate_summary([str(item.get("summary", "")) for item in function_nodes], file_path.name)
+        file_hash = _sha1_text(
+            "|".join([file_hashes.get(file_abs, ""), file_summary, ",".join(sorted(child_ids))])
+        )
+        file_id = _node_id("file", file_abs, file_path.name)
+        file_node = {
+            "id": file_id,
+            "kind": "file",
+            "path": file_abs,
+            "name": file_path.name,
+            "summary": file_summary,
+            "children": child_ids,
+            "language": semantic_mod._detect_language(file_path),
+            "symbol_count": len(child_ids),
+            "last_updated": _utc_now(),
+            "hash": file_hash,
+        }
+        nodes[file_id] = file_node
+        file_node_ids.append(file_id)
+        for child_id in child_ids:
+            edges.append({"parent": file_id, "child": child_id})
+        parent_dir = str(file_path.parent.resolve())
+        dir_children[parent_dir].append(file_id)
+
+    # Build directory nodes bottom-up.
+    directory_paths = sorted(dir_children.keys(), key=lambda item: len(Path(item).parts), reverse=True)
+    seen_dirs: set[str] = set(directory_paths)
+    for path_str in list(directory_paths):
+        cursor = Path(path_str)
+        while str(cursor.resolve()) != str(root):
+            cursor = cursor.parent
+            resolved = str(cursor.resolve())
+            if not resolved.startswith(str(root)):
+                break
+            if resolved not in seen_dirs:
+                seen_dirs.add(resolved)
+                directory_paths.append(resolved)
+    directory_paths = sorted(set(directory_paths), key=lambda item: len(Path(item).parts), reverse=True)
+
+    dir_node_ids: dict[str, str] = {}
+    for dir_path in directory_paths:
+        children = list(dir_children.get(dir_path, []))
+        child_summaries = [str(nodes[cid].get("summary", "")) for cid in children if cid in nodes]
+        symbol_count = sum(int(nodes[cid].get("symbol_count", 0) or 0) for cid in children if cid in nodes)
+        name = Path(dir_path).name or Path(dir_path).anchor or "."
+        summary = _aggregate_summary(child_summaries, f"Directory {name}")
+        node_hash = _sha1_text("|".join(sorted(str(nodes[cid].get("hash", "")) for cid in children if cid in nodes)))
+        node_id = _node_id("directory", dir_path, name)
+        node = {
+            "id": node_id,
+            "kind": "directory",
+            "path": dir_path,
+            "name": name,
+            "summary": summary,
+            "children": children,
+            "language": "mixed",
+            "symbol_count": symbol_count,
+            "last_updated": _utc_now(),
+            "hash": node_hash,
+        }
+        nodes[node_id] = node
+        dir_node_ids[dir_path] = node_id
+        for child in children:
+            edges.append({"parent": node_id, "child": child})
+
+        parent = str(Path(dir_path).parent.resolve())
+        if parent.startswith(str(root)) and parent != dir_path:
+            dir_children[parent].append(node_id)
+
+    repo_path = str(root)
+    repo_children = list(dict.fromkeys(dir_children.get(repo_path, []) + file_node_ids))
+    repo_children = [cid for cid in repo_children if cid in nodes]
+    repo_summary = _aggregate_summary([str(nodes[cid].get("summary", "")) for cid in repo_children], root.name)
+    repo_hash = _sha1_text("|".join(sorted(str(nodes[cid].get("hash", "")) for cid in repo_children)))
+    repo_id = _node_id("repository", repo_path, root.name)
+    nodes[repo_id] = {
+        "id": repo_id,
+        "kind": "repository",
+        "path": repo_path,
+        "name": root.name or repo_path,
+        "summary": repo_summary,
+        "children": repo_children,
+        "language": "mixed",
+        "symbol_count": sum(int(nodes[cid].get("symbol_count", 0) or 0) for cid in repo_children),
+        "last_updated": _utc_now(),
+        "hash": repo_hash,
+    }
+    for child in repo_children:
+        edges.append({"parent": repo_id, "child": child})
+
+    payload = {
+        "version": INDEX_VERSION,
+        "root": repo_path,
+        "created_at": _utc_now(),
+        "updated_at": _utc_now(),
+        "include_glob": include_glob,
+        "nodes": nodes,
+        "edges": edges,
+        "stats": {
+            "node_count": len(nodes),
+            "function_count": sum(1 for node in nodes.values() if node.get("kind") == "function"),
+            "file_count": sum(1 for node in nodes.values() if node.get("kind") == "file"),
+            "directory_count": sum(1 for node in nodes.values() if node.get("kind") == "directory"),
+            "repository_count": sum(1 for node in nodes.values() if node.get("kind") == "repository"),
+            "reused_file_count": reused_file_count,
+            "rebuilt_file_count": rebuilt_file_count,
+            "cache_hit": reused_file_count > 0 and rebuilt_file_count == 0,
+        },
+        "artifacts": {
+            "cache_path": str(old_cache_path),
+            "file_hashes": file_hashes,
+        },
+    }
+
+    old_cache_path.parent.mkdir(parents=True, exist_ok=True)
+    old_cache_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return payload
+
+
+def load_hierarchical_code_index(path: str, include_glob: str = semantic_mod.DEFAULT_INCLUDE_GLOB) -> dict[str, Any]:
+    cache = _cache_file(path, include_glob)
+    if not cache.exists():
+        return {}
+    return _safe_read_json(cache)
+
+
+@tool
+def build_hierarchical_code_index(
+    path: str,
+    rebuild: bool = False,
+    use_llm: bool = False,
+    include_glob: str = semantic_mod.DEFAULT_INCLUDE_GLOB,
+    max_files: int = 2000,
+) -> str:
+    """Build hierarchical semantic code index (function/file/directory/repository) with disk cache."""
+    try:
+        payload = _build_hierarchical_index_payload(
+            path=path,
+            rebuild=bool(rebuild),
+            use_llm=bool(use_llm),
+            include_glob=include_glob,
+            max_files=max(1, int(max_files)),
+        )
+        return json.dumps(
+            {
+                "status": "ok",
+                "root": payload.get("root", ""),
+                "version": payload.get("version", INDEX_VERSION),
+                "stats": payload.get("stats", {}),
+                "cache_path": payload.get("artifacts", {}).get("cache_path", ""),
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    except Exception as exc:
+        return f"build_hierarchical_code_index error: {exc}"

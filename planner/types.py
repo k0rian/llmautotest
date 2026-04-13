@@ -2,7 +2,17 @@ from dataclasses import asdict, dataclass
 from typing import Any, Literal, TypedDict
 
 
-StepMode = Literal["code_audit", "gui_test", "analysis", "semantic_diff", "invalid"]
+StepMode = Literal[
+    "code_audit",
+    "gui_test",
+    "analysis",
+    "semantic_diff",
+    "semantic_index",
+    "semantic_localize",
+    "semantic_retrieve",
+    "semantic_validate",
+    "invalid",
+]
 
 
 class AuditState(TypedDict, total=False):
@@ -92,6 +102,7 @@ class PlannerRuntimeState:
     latest_failure_category: str = ""
     semantic_required: bool = False
     semantic_target_hint: str = ""
+    semantic_context: dict[str, Any] | None = None
     status: RuntimeStatus = "running"
 
     def to_dict(self) -> dict[str, Any]:
@@ -109,6 +120,7 @@ class PlannerRuntimeState:
             "latest_failure_category": self.latest_failure_category,
             "semantic_required": self.semantic_required,
             "semantic_target_hint": self.semantic_target_hint,
+            "semantic_context": dict(self.semantic_context or {}),
             "status": self.status,
         }
 
