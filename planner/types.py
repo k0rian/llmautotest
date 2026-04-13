@@ -18,6 +18,8 @@ class AuditState(TypedDict, total=False):
     audit_output: str
     planner_runtime: dict[str, Any]
     final_output: str
+    final_output_file: str
+    final_output_write_error: str
 
 
 @dataclass

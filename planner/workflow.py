@@ -18,6 +18,7 @@ from planner.policies import (
 )
 from planner.state import format_steps, read_text
 from planner.types import AuditState
+from tools.core import ProjectContext
 
 PROMPT_DIR = Path(__file__).resolve().parent / "prompt"
 
@@ -84,6 +85,7 @@ def planner_execute_node_factory(planner: Any):
                 "audit_output": "Workspace path is empty",
                 "planner_runtime": {},
             }
+        ProjectContext.directory = Path(workspace_path).resolve()
 
         skill_prompt = state.get("skill_prompt", "")
         perception_meta = state.get("perception_meta", {})
