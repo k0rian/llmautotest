@@ -18,6 +18,7 @@ from planner.policies import (
 )
 from planner.state import format_steps, read_text
 from planner.types import AuditState
+from tools.core import ProjectContext
 
 PROMPT_DIR = Path(__file__).resolve().parent / "prompt"
 
@@ -84,6 +85,7 @@ def planner_execute_node_factory(planner: Any):
                 "audit_output": "Workspace path is empty",
                 "planner_runtime": {},
             }
+        ProjectContext.directory = Path(workspace_path).resolve()
 
         skill_prompt = state.get("skill_prompt", "")
         perception_meta = state.get("perception_meta", {})
@@ -92,6 +94,7 @@ def planner_execute_node_factory(planner: Any):
 
         semantic_intent = False
         semantic_fallback = not lsp_ready
+        semantic_target_hint = ""
         hint_text = ""
         fallback_guidance = ""
         semantic_intent_guidance = ""
@@ -100,8 +103,11 @@ def planner_execute_node_factory(planner: Any):
             if isinstance(hints, dict):
                 semantic_intent = bool(hints.get("semantic_intent", False))
                 semantic_fallback = bool(hints.get("semantic_fallback", semantic_fallback))
+                semantic_target_hint = read_text(hints.get("semantic_target_hint", "")).strip()
             if hints:
                 hint_text = f"\n\nPerception hints:\n{json.dumps(hints, ensure_ascii=False)}"
+        if not semantic_target_hint:
+            semantic_target_hint = _extract_target_hint(request)
 
         if semantic_fallback:
             fallback_reason = lsp_error or "LSP service is unavailable"
@@ -143,6 +149,8 @@ def planner_execute_node_factory(planner: Any):
                 "context": context,
                 "max_steps": DEFAULT_MAX_STEPS,
                 "workspace_path": workspace_path,
+                "semantic_required": bool(semantic_fallback or semantic_intent),
+                "semantic_target_hint": semantic_target_hint,
             }
         )
         summary = read_text(result.get("summary", "")).strip()
@@ -199,3 +207,16 @@ def runtime_import_traceback() -> str:
     if RUNTIME_IMPORT_ERROR is None:
         return ""
     return traceback.format_exc()
+
+
+def _extract_target_hint(request: str) -> str:
+    text = (request or "").strip()
+    if not text:
+        return ""
+    import re
+
+    match = re.search(r"([A-Za-z0-9_\-./\\]+[/\\])", text)
+    if not match:
+        return ""
+    token = match.group(1).strip().strip("`'\"")
+    return token

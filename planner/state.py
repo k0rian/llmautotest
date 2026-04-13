@@ -65,6 +65,8 @@ def create_runtime_state(
     context: str,
     summary: str,
     steps: list[PlanStep],
+    semantic_required: bool = False,
+    semantic_target_hint: str = "",
 ) -> PlannerRuntimeState:
     return PlannerRuntimeState(
         objective=objective,
@@ -76,6 +78,10 @@ def create_runtime_state(
         tool_history=[],
         evidence=[],
         open_questions=[],
+        failure_counts={},
+        latest_failure_category="",
+        semantic_required=semantic_required,
+        semantic_target_hint=semantic_target_hint,
         status="running",
     )
 
@@ -148,3 +154,13 @@ def append_open_question(state: PlannerRuntimeState, question: str) -> None:
     if state.open_questions is None:
         state.open_questions = []
     state.open_questions.append(text)
+
+
+def record_failure_category(state: PlannerRuntimeState, category: str) -> None:
+    value = category.strip()
+    if not value:
+        return
+    if state.failure_counts is None:
+        state.failure_counts = {}
+    state.failure_counts[value] = int(state.failure_counts.get(value, 0)) + 1
+    state.latest_failure_category = value

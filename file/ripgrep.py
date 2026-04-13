@@ -1,54 +1,71 @@
-
 import json
 import os
 import shutil
+import subprocess
 import tarfile
 import tempfile
 import zipfile
-from urllib.request import Request, urlopen
 from pathlib import Path
-from typing import Dict,Optional, Any
+from typing import Any, Dict, Optional
+from urllib.request import Request, urlopen
+
 
 class Ripgrep:
-    """跨平台 Ripgrep 工具封装：查找 rg 二进制路径、校验安装状态"""
+    """Cross-platform ripgrep helper that locates or installs rg."""
+
     RG_BIN_NAMES = {
         "windows": "rg.exe",
         "darwin": "rg",
-        "linux": "rg"
+        "linux": "rg",
     }
     GITHUB_API_LATEST = "https://api.github.com/repos/BurntSushi/ripgrep/releases/latest"
     INSTALL_ROOT = Path(__file__).resolve().parent / ".bin" / "ripgrep"
 
     @classmethod
     def _get_platform_bin_name(cls) -> str:
-        """根据系统获取 rg 二进制文件名"""
         import platform
+
         system = platform.system().lower()
         return cls.RG_BIN_NAMES.get(system, "rg")
 
     @classmethod
     async def filepath(cls) -> str:
-        """查找 rg 二进制路径（优先系统 PATH，不存在则自动下载）"""
+        """Locate rg binary, preferring PATH/cache and falling back to download."""
         rg_bin = cls._get_platform_bin_name()
-        rg_path = shutil.which(rg_bin)
-        if not rg_path:
-            rg_path = cls._find_cached_binary()
-        if not rg_path:
-            rg_path = await cls._download_latest_binary()
-        if not rg_path:
-            raise RuntimeError("Failed to locate or install ripgrep binary")
-        if not os.access(rg_path, os.X_OK):
-            raise PermissionError(f"ripgrep binary {rg_path} is not executable")
+        for candidate in (shutil.which(rg_bin), cls._find_cached_binary()):
+            if candidate and cls._is_usable_binary(candidate):
+                return candidate
+
+        rg_path = await cls._download_latest_binary()
+        if not rg_path or not cls._is_usable_binary(rg_path):
+            raise RuntimeError("Failed to locate or install an executable ripgrep binary")
         return rg_path
+
+    @classmethod
+    def _is_usable_binary(cls, path: str) -> bool:
+        try:
+            if not (os.path.isfile(path) and os.access(path, os.X_OK)):
+                return False
+            # Some binaries on PATH can pass os.access but still fail at process creation.
+            probe = subprocess.run(
+                [path, "--version"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                shell=False,
+            )
+            return probe.returncode == 0
+        except (OSError, subprocess.SubprocessError, PermissionError):
+            return False
 
     @classmethod
     def _find_cached_binary(cls) -> Optional[str]:
         if not cls.INSTALL_ROOT.exists():
             return None
+
         bin_name = cls._get_platform_bin_name()
-        candidates = list(cls.INSTALL_ROOT.rglob(bin_name))
-        for candidate in candidates:
-            if candidate.is_file():
+        for candidate in cls.INSTALL_ROOT.rglob(bin_name):
+            if candidate.is_file() and cls._is_usable_binary(str(candidate)):
                 return str(candidate.resolve())
         return None
 
@@ -58,17 +75,20 @@ class Ripgrep:
         asset = cls._select_asset(release)
         if not asset:
             raise RuntimeError("No compatible ripgrep release asset found for current platform")
+
         cls.INSTALL_ROOT.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory() as tmpdir:
             archive_path = Path(tmpdir) / asset["name"]
             cls._download_file(asset["browser_download_url"], archive_path)
             cls._extract_archive(archive_path, cls.INSTALL_ROOT)
+
         binary_path = cls._find_cached_binary()
         if not binary_path:
             raise RuntimeError("ripgrep downloaded but binary not found after extraction")
+
         try:
             os.chmod(binary_path, 0o755)
-        except Exception:
+        except OSError:
             pass
         return binary_path
 
@@ -83,6 +103,7 @@ class Ripgrep:
         )
         with urlopen(req, timeout=20) as resp:
             payload = resp.read().decode("utf-8")
+
         data = json.loads(payload)
         if not isinstance(data, dict):
             raise RuntimeError("Invalid GitHub release response")
@@ -91,6 +112,7 @@ class Ripgrep:
     @classmethod
     def _asset_suffix(cls) -> str:
         import platform
+
         system = platform.system().lower()
         machine = platform.machine().lower()
         normalized = {
@@ -100,6 +122,7 @@ class Ripgrep:
             "arm64": "aarch64",
             "aarch64": "aarch64",
         }.get(machine, machine)
+
         if system == "windows":
             if normalized == "aarch64":
                 return "aarch64-pc-windows-msvc.zip"
@@ -122,6 +145,7 @@ class Ripgrep:
             name = str(asset.get("name", ""))
             if name.endswith(suffix):
                 return asset
+
         if suffix.startswith("aarch64"):
             fallback_suffix = suffix.replace("aarch64", "x86_64")
             for asset in assets:

@@ -4,11 +4,38 @@ from planner.policies import ALLOW_REPLAN_REASONS, DEFAULT_MAX_REPLANS, MIN_EVID
 from planner.types import PlanStep, PlannerRuntimeState, StepMode, StepOutcome
 
 
-def verify_step_result(step_mode: StepMode, result_text: str) -> tuple[bool, str]:
+def verify_step_result(
+    step_mode: StepMode,
+    result_text: str,
+    structured_output: dict | None = None,
+) -> tuple[bool, str]:
     text = (result_text or "").strip()
     if not text:
         return False, "no_evidence"
     lowered = text.lower()
+
+    if step_mode == "invalid":
+        return False, "invalid_mode"
+
+    if step_mode == "semantic_diff" and isinstance(structured_output, dict):
+        error_stage = str(structured_output.get("error_stage", "")).strip().lower()
+        if error_stage == "scope_invalid":
+            return False, "scope_invalid"
+        if error_stage in {"index", "diff", "tool_failed"}:
+            return False, "tool_failed"
+
+        index_success = bool(structured_output.get("index_success", False))
+        diff_success = bool(structured_output.get("diff_success", False))
+        if not (index_success and diff_success):
+            return False, "tool_failed"
+
+        matched_count = int(structured_output.get("matched_count", 0) or 0)
+        missing_count = int(structured_output.get("missing_count", 0) or 0)
+        evidence_paths = structured_output.get("evidence_paths", [])
+        evidence_count = len(evidence_paths) if isinstance(evidence_paths, list) else 0
+        if matched_count + missing_count <= 0 and evidence_count <= 0:
+            return False, "no_evidence"
+        return True, "ok"
 
     failed_markers = (
         "tool error",
@@ -67,7 +94,7 @@ def build_step_outcome(
         )
     return StepOutcome(
         step_id=step.id,
-        status="failed" if reason == "tool_failed" else "needs_replan",
+        status="needs_replan" if reason in ALLOW_REPLAN_REASONS else "failed",
         goal_satisfied=False,
         summary=text[:600],
         new_evidence_ids=list(evidence_ids or []),
