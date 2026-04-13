@@ -41,6 +41,8 @@ def finalizer_node(state: AuditState) -> AuditState:
         completed = sum(1 for item in steps if isinstance(item, dict) and item.get("status") == "completed")
         failed = sum(1 for item in steps if isinstance(item, dict) and item.get("status") == "failed")
         replan_count = runtime.get("replan_count", 0)
+        latest_failure_category = str(runtime.get("latest_failure_category", "")).strip()
+        failure_counts = runtime.get("failure_counts", {}) if isinstance(runtime.get("failure_counts"), dict) else {}
         evidence = runtime.get("evidence", []) if isinstance(runtime.get("evidence"), list) else []
         top_evidence_lines: list[str] = []
         for idx, item in enumerate(evidence[:3], start=1):
@@ -49,10 +51,15 @@ def finalizer_node(state: AuditState) -> AuditState:
             summary = str(item.get("summary", "")).strip()
             if summary:
                 top_evidence_lines.append(f"{idx}. {summary[:120]}")
+        failure_count_text = "N/A"
+        if failure_counts:
+            failure_count_text = ", ".join(f"{k}={v}" for k, v in sorted(failure_counts.items()))
         runtime_summary = (
             f"- Step completed: {completed}\n"
             f"- Step failed: {failed}\n"
             f"- Replan count: {replan_count}\n"
+            f"- Failure categories: {failure_count_text}\n"
+            f"- Latest blocking reason: {latest_failure_category or 'N/A'}\n"
             f"- Top evidence:\n{chr(10).join(top_evidence_lines) if top_evidence_lines else 'N/A'}"
         )
     final_output = (

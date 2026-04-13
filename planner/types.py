@@ -2,7 +2,7 @@ from dataclasses import asdict, dataclass
 from typing import Any, Literal, TypedDict
 
 
-StepMode = Literal["code_audit", "gui_test", "analysis", "semantic_diff"]
+StepMode = Literal["code_audit", "gui_test", "analysis", "semantic_diff", "invalid"]
 
 
 class AuditState(TypedDict, total=False):
@@ -29,6 +29,8 @@ class PlanStep:
     mode: StepMode
     objective: str
     expected_output: str
+    target_path: str = ""
+    raw_mode: str = ""
     status: str = "pending"
     result: str = ""
     notes: str = ""
@@ -45,6 +47,7 @@ class ToolExecutionRecord:
     output_summary: str
     success: bool
     error_message: str = ""
+    structured_output: dict[str, Any] | None = None
 
 
 @dataclass
@@ -85,6 +88,10 @@ class PlannerRuntimeState:
     tool_history: list[ToolExecutionRecord] | None = None
     evidence: list[EvidenceItem] | None = None
     open_questions: list[str] | None = None
+    failure_counts: dict[str, int] | None = None
+    latest_failure_category: str = ""
+    semantic_required: bool = False
+    semantic_target_hint: str = ""
     status: RuntimeStatus = "running"
 
     def to_dict(self) -> dict[str, Any]:
@@ -98,6 +105,10 @@ class PlannerRuntimeState:
             "tool_history": [asdict(item) for item in (self.tool_history or [])],
             "evidence": [asdict(item) for item in (self.evidence or [])],
             "open_questions": list(self.open_questions or []),
+            "failure_counts": dict(self.failure_counts or {}),
+            "latest_failure_category": self.latest_failure_category,
+            "semantic_required": self.semantic_required,
+            "semantic_target_hint": self.semantic_target_hint,
             "status": self.status,
         }
 

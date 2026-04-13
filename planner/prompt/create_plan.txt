@@ -4,6 +4,7 @@ Generate an executable plan for the user objective.
 - Number of steps: 1 to 6.
 - Each step must be atomic and verifiable.
 - mode must be one of: code_audit, gui_test, analysis, semantic_diff.
+- For semantic_diff steps, include an optional target_path when scope should be limited (for example "bfdd/").
 - Prefer code_audit for source reading, static analysis, LSP inspection, and file search.
 - Use gui_test only for real UI interaction/verification.
 - Use analysis for synthesis/judgment/conclusion steps.
@@ -11,7 +12,7 @@ Generate an executable plan for the user objective.
 
 Return JSON only, no markdown.
 JSON format:
-{{"summary":"...","steps":[{{"title":"...","mode":"code_audit","objective":"...","expected_output":"..."}}]}}
+{{"summary":"...","steps":[{{"title":"...","mode":"code_audit","objective":"...","expected_output":"...","target_path":""}}]}}
 
 Available tools:
 {tool_descriptions}

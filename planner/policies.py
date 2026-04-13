@@ -1,7 +1,7 @@
 from pathlib import Path
 
 
-DEFAULT_MODEL_NAME = "ep-20260413101516-fltw5"
+DEFAULT_MODEL_NAME = "doubao-seed-1-8-251228"
 DEFAULT_BASE_URL = "https://ark.cn-beijing.volces.com/api/v3"
 DEFAULT_AUDIT_REQUEST = "Run a static code audit for the current workspace, focusing on bugs, performance issues, and optimization opportunities."
 
