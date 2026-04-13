@@ -75,6 +75,22 @@ def _extract_functions_for_file(file_path: Path) -> list[dict[str, Any]]:
         return []
 
 
+def _collect_all_directory_paths(files: list[Path], root: Path) -> list[str]:
+    root_resolved = str(root.resolve())
+    dirs: set[str] = set()
+    for file_path in files:
+        cursor = file_path.parent.resolve()
+        while True:
+            current = str(cursor)
+            if not current.startswith(root_resolved):
+                break
+            dirs.add(current)
+            if current == root_resolved:
+                break
+            cursor = cursor.parent
+    return sorted(dirs, key=lambda item: len(Path(item).parts), reverse=True)
+
+
 def _build_hierarchical_index_payload(
     path: str,
     rebuild: bool,
@@ -169,7 +185,8 @@ def _build_hierarchical_index_payload(
             nodes[str(fn["id"])] = fn
 
     file_node_ids: list[str] = []
-    dir_children: dict[str, list[str]] = defaultdict(list)
+    file_nodes_by_path: dict[str, str] = {}
+    dir_file_children: dict[str, list[str]] = defaultdict(list)
 
     for file_path in files:
         file_abs = str(file_path.resolve())
@@ -194,35 +211,39 @@ def _build_hierarchical_index_payload(
         }
         nodes[file_id] = file_node
         file_node_ids.append(file_id)
+        file_nodes_by_path[file_abs] = file_id
         for child_id in child_ids:
             edges.append({"parent": file_id, "child": child_id})
         parent_dir = str(file_path.parent.resolve())
-        dir_children[parent_dir].append(file_id)
+        dir_file_children[parent_dir].append(file_id)
 
-    # Build directory nodes bottom-up.
-    directory_paths = sorted(dir_children.keys(), key=lambda item: len(Path(item).parts), reverse=True)
-    seen_dirs: set[str] = set(directory_paths)
-    for path_str in list(directory_paths):
-        cursor = Path(path_str)
-        while str(cursor.resolve()) != str(root):
-            cursor = cursor.parent
-            resolved = str(cursor.resolve())
-            if not resolved.startswith(str(root)):
-                break
-            if resolved not in seen_dirs:
-                seen_dirs.add(resolved)
-                directory_paths.append(resolved)
-    directory_paths = sorted(set(directory_paths), key=lambda item: len(Path(item).parts), reverse=True)
+    directory_paths = _collect_all_directory_paths(files=files, root=root)
+    dir_dir_children: dict[str, list[str]] = defaultdict(list)
+    for dir_path in directory_paths:
+        if dir_path == str(root):
+            continue
+        parent = str(Path(dir_path).parent.resolve())
+        if parent.startswith(str(root)):
+            dir_dir_children[parent].append(dir_path)
 
     dir_node_ids: dict[str, str] = {}
     for dir_path in directory_paths:
-        children = list(dir_children.get(dir_path, []))
+        raw_child_file_ids = list(dict.fromkeys(dir_file_children.get(dir_path, [])))
+        raw_child_dir_paths = list(dict.fromkeys(dir_dir_children.get(dir_path, [])))
+        child_dir_ids = [dir_node_ids[path] for path in raw_child_dir_paths if path in dir_node_ids]
+        children = raw_child_file_ids + child_dir_ids
         child_summaries = [str(nodes[cid].get("summary", "")) for cid in children if cid in nodes]
         symbol_count = sum(int(nodes[cid].get("symbol_count", 0) or 0) for cid in children if cid in nodes)
         name = Path(dir_path).name or Path(dir_path).anchor or "."
         summary = _aggregate_summary(child_summaries, f"Directory {name}")
         node_hash = _sha1_text("|".join(sorted(str(nodes[cid].get("hash", "")) for cid in children if cid in nodes)))
         node_id = _node_id("directory", dir_path, name)
+        if dir_path == str(root):
+            parent_dir = ""
+            depth = 0
+        else:
+            parent_dir = str(Path(dir_path).parent.resolve())
+            depth = len(Path(dir_path).relative_to(root).parts)
         node = {
             "id": node_id,
             "kind": "directory",
@@ -234,18 +255,31 @@ def _build_hierarchical_index_payload(
             "symbol_count": symbol_count,
             "last_updated": _utc_now(),
             "hash": node_hash,
+            "parent": parent_dir,
+            "depth": depth,
         }
         nodes[node_id] = node
         dir_node_ids[dir_path] = node_id
         for child in children:
             edges.append({"parent": node_id, "child": child})
 
-        parent = str(Path(dir_path).parent.resolve())
-        if parent.startswith(str(root)) and parent != dir_path:
-            dir_children[parent].append(node_id)
-
     repo_path = str(root)
-    repo_children = list(dict.fromkeys(dir_children.get(repo_path, []) + file_node_ids))
+    top_level_dir_ids: list[str] = []
+    top_level_root_file_ids: list[str] = []
+    for dir_path, node_id in dir_node_ids.items():
+        if dir_path == repo_path:
+            continue
+        rel = Path(dir_path).relative_to(root)
+        if len(rel.parts) == 1:
+            top_level_dir_ids.append(node_id)
+    for file_abs, file_id in file_nodes_by_path.items():
+        try:
+            rel = Path(file_abs).resolve().relative_to(root)
+        except Exception:
+            continue
+        if len(rel.parts) == 1:
+            top_level_root_file_ids.append(file_id)
+    repo_children = list(dict.fromkeys(top_level_dir_ids + top_level_root_file_ids))
     repo_children = [cid for cid in repo_children if cid in nodes]
     repo_summary = _aggregate_summary([str(nodes[cid].get("summary", "")) for cid in repo_children], root.name)
     repo_hash = _sha1_text("|".join(sorted(str(nodes[cid].get("hash", "")) for cid in repo_children)))

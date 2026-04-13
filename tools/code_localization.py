@@ -67,6 +67,53 @@ def _pick_top(nodes: list[dict[str, Any]], query_tokens: list[str], top_k: int) 
     return scored[: max(1, top_k)]
 
 
+def _build_parent_chain(node: dict[str, Any], nodes_map: dict[str, dict[str, Any]]) -> list[str]:
+    if not isinstance(node, dict):
+        return []
+    labels: list[str] = []
+    kind = str(node.get("kind", ""))
+    name = str(node.get("name", "")) or str(node.get("path", ""))
+    if name:
+        labels.append(name)
+
+    if kind == "directory":
+        current = node
+        for _ in range(12):
+            parent_path = str(current.get("parent", "")).strip()
+            if not parent_path:
+                break
+            parent_node = None
+            for candidate in nodes_map.values():
+                if not isinstance(candidate, dict):
+                    continue
+                if candidate.get("kind") != "directory":
+                    continue
+                if str(candidate.get("path", "")) == parent_path:
+                    parent_node = candidate
+                    break
+            if not parent_node:
+                break
+            label = str(parent_node.get("name", "")) or str(parent_node.get("path", ""))
+            if label:
+                labels.append(label)
+            current = parent_node
+        return list(reversed(labels))
+
+    if kind in {"file", "function"}:
+        file_path = str(node.get("path", "")).strip()
+        if file_path:
+            file_parent = str(Path(file_path).parent)
+            for candidate in nodes_map.values():
+                if not isinstance(candidate, dict):
+                    continue
+                if candidate.get("kind") != "directory":
+                    continue
+                if str(candidate.get("path", "")) == file_parent:
+                    dir_chain = _build_parent_chain(candidate, nodes_map)
+                    return dir_chain + labels
+    return labels
+
+
 def _node_map(payload: dict[str, Any]) -> dict[str, dict[str, Any]]:
     nodes = payload.get("nodes", {})
     return nodes if isinstance(nodes, dict) else {}
@@ -110,6 +157,9 @@ def semantic_localize_requirement(path: str, requirement: str, top_k: int = 5) -
         if not directory_pool:
             directory_pool = [node for node in nodes.values() if node.get("kind") == "directory"]
         top_dirs = _pick_top(directory_pool, query_tokens, top_k=max(2, top_k))
+        for item in top_dirs:
+            raw = nodes.get(str(item.get("id", "")), {})
+            item["parent_chain"] = _build_parent_chain(raw, nodes)
 
         file_pool: list[dict[str, Any]] = []
         for item in top_dirs:
@@ -119,6 +169,9 @@ def semantic_localize_requirement(path: str, requirement: str, top_k: int = 5) -
         if not file_pool:
             file_pool = [node for node in nodes.values() if node.get("kind") == "file"]
         top_files = _pick_top(file_pool, query_tokens, top_k=max(2, top_k))
+        for item in top_files:
+            raw = nodes.get(str(item.get("id", "")), {})
+            item["parent_chain"] = _build_parent_chain(raw, nodes)
 
         function_pool: list[dict[str, Any]] = []
         file_ids = {str(item.get("id", "")) for item in top_files}
@@ -129,6 +182,9 @@ def semantic_localize_requirement(path: str, requirement: str, top_k: int = 5) -
         if not function_pool:
             function_pool = [node for node in nodes.values() if node.get("kind") == "function"]
         top_functions = _pick_top(function_pool, query_tokens, top_k=max(2, top_k))
+        for item in top_functions:
+            raw = nodes.get(str(item.get("id", "")), {})
+            item["parent_chain"] = _build_parent_chain(raw, nodes)
 
         return json.dumps(
             {

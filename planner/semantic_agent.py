@@ -5,6 +5,7 @@ from typing import Any
 from planner.types import PlanStep, PlannerRuntimeState
 from planner.semantic_state_machine import SemanticStateMachine
 from tools.code_index import build_hierarchical_code_index, load_hierarchical_code_index
+from tools.semantic_diff_ts import semantic_index_functions
 
 
 def _parse_json_text(text: str) -> dict[str, Any]:
@@ -48,6 +49,12 @@ class SemanticAgent:
                 build_hierarchical_code_index.func(path=target_path, rebuild=False, use_llm=False)
             )
             cache = load_hierarchical_code_index(target_path)
+            fallback = {}
+            index_success = result.get("status") == "ok"
+            if not index_success:
+                fallback = _parse_json_text(
+                    semantic_index_functions.func(path=target_path, rebuild=False)
+                )
             context.update(
                 {
                     "path": target_path,
@@ -55,21 +62,24 @@ class SemanticAgent:
                     "requirement": requirement,
                     "index_result": result,
                     "index_stats": cache.get("stats", {}),
+                    "index_fallback": fallback,
                 }
             )
             summary = (
                 "semantic_index workflow summary\n"
                 f"- root: {result.get('root', '') or target_path}\n"
                 f"- cache_path: {result.get('cache_path', '')}\n"
-                f"- stats: {json.dumps(result.get('stats', {}), ensure_ascii=False)}"
+                f"- stats: {json.dumps(result.get('stats', {}), ensure_ascii=False)}\n"
+                f"- fallback_used: {bool(fallback)}"
             )
             return summary, {
                 "stage": "semantic_index",
-                "index_success": result.get("status") == "ok",
+                "index_success": index_success,
                 "root": result.get("root", target_path),
                 "cache_path": result.get("cache_path", ""),
                 "stats": result.get("stats", {}),
                 "requirement": requirement,
+                "fallback": fallback,
             }
 
         if mode == "semantic_localize":
@@ -97,8 +107,11 @@ class SemanticAgent:
                 "requirement": requirement,
                 "localized_candidates": candidates,
                 "preliminary_finding": detect.get("preliminary_finding", "unknown"),
+                "reason": detect.get("reason", ""),
+                "gaps": detect.get("gaps", []),
+                "matched_symbols": detect.get("matched_symbols", []),
                 "decision": detect.get("preliminary_finding", "unknown"),
-                "confidence": 0.55,
+                "confidence": float(detect.get("confidence", 0.45) or 0.45),
                 "retrieved_contexts": [],
                 "evidence": [],
                 "missing_requirements": [],
@@ -114,21 +127,20 @@ class SemanticAgent:
 
             detect_1 = self.state_machine.detect(requirement=requirement, localized=localized, retrieved=[])
             retrieved = self.state_machine.retrieve(path=target_path, localized=localized, top_k=3)
-            retrieval_evidence: list[dict[str, Any]] = []
-            for block in retrieved:
-                if not isinstance(block, dict):
-                    continue
-                for key in ("definition", "callees", "callers"):
-                    value = block.get(key, [])
-                    if isinstance(value, list):
-                        retrieval_evidence.extend([item for item in value if isinstance(item, dict)])
-            detect_2 = self.state_machine.detect(requirement=requirement, localized=localized, retrieved=retrieval_evidence)
+            if not retrieved:
+                fallback_localized = self.state_machine.localize(path=target_path, requirement=requirement, top_k=12)
+                localized = fallback_localized or localized
+                context["localized"] = localized
+                retrieved = self.state_machine.retrieve(path=target_path, localized=localized, top_k=8)
+
+            evidence = self.state_machine.build_validation_evidence(localized=localized, retrieved=retrieved)
+            detect_2 = self.state_machine.detect(requirement=requirement, localized=localized, retrieved=retrieved)
             context.update(
                 {
                     "path": target_path,
                     "requirement": requirement,
                     "retrieved": retrieved,
-                    "retrieval_evidence": retrieval_evidence,
+                    "retrieval_evidence": evidence,
                     "preliminary_finding": detect_2,
                 }
             )
@@ -136,7 +148,7 @@ class SemanticAgent:
                 "semantic_retrieve workflow summary\n"
                 f"- detect_before: {detect_1.get('preliminary_finding', 'unknown')}\n"
                 f"- retrieved_context_blocks: {len(retrieved)}\n"
-                f"- retrieval_evidence: {len(retrieval_evidence)}\n"
+                f"- retrieval_evidence: {len(evidence)}\n"
                 f"- detect_after: {detect_2.get('preliminary_finding', 'unknown')}"
             )
             prelim = str(detect_2.get("preliminary_finding", "unknown"))
@@ -147,8 +159,11 @@ class SemanticAgent:
                 "retrieved_contexts": retrieved,
                 "decision": prelim,
                 "preliminary_finding": prelim,
-                "confidence": 0.62 if prelim != "unknown" else 0.45,
-                "evidence": retrieval_evidence,
+                "reason": detect_2.get("reason", ""),
+                "gaps": detect_2.get("gaps", []),
+                "matched_symbols": detect_2.get("matched_symbols", []),
+                "confidence": float(detect_2.get("confidence", 0.45) or 0.45),
+                "evidence": evidence,
                 "missing_requirements": [requirement] if prelim in {"missing", "violated"} else [],
                 "covered_requirements": [requirement] if prelim == "covered" else [],
                 "partial_requirements": [requirement] if prelim == "partial" else [],
@@ -163,15 +178,7 @@ class SemanticAgent:
                 localized = self.state_machine.localize(path=target_path, requirement=requirement, top_k=5)
             if not retrieved:
                 retrieved = self.state_machine.retrieve(path=target_path, localized=localized, top_k=3)
-
-            evidence: list[dict[str, Any]] = []
-            for block in retrieved:
-                if not isinstance(block, dict):
-                    continue
-                for key in ("definition", "callees", "callers"):
-                    value = block.get(key, [])
-                    if isinstance(value, list):
-                        evidence.extend([item for item in value if isinstance(item, dict)])
+            evidence = self.state_machine.build_validation_evidence(localized=localized, retrieved=retrieved)
 
             validated = self.state_machine.validate(
                 requirement=requirement,
@@ -179,6 +186,8 @@ class SemanticAgent:
                 preliminary_finding=preliminary,
             )
             decision = str(validated.get("decision", preliminary))
+            if not evidence and decision not in {"unknown", "evidence_insufficient"}:
+                decision = "unknown"
             confidence = float(validated.get("confidence", 0.5) or 0.5)
             context.update(
                 {

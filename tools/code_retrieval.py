@@ -77,13 +77,23 @@ def _evidence(
     signature: str,
     source_summary: str,
     reason: str,
+    kind: str = "function",
+    summary: str = "",
+    source_excerpt: str = "",
+    call_site: dict[str, Any] | None = None,
+    why_relevant: str = "",
 ) -> dict[str, Any]:
     return {
         "file_path": file_path,
         "line_range": [start, end],
         "symbol_name": symbol_name,
+        "kind": kind,
         "signature": signature,
+        "summary": (summary or source_summary)[:260],
         "source_summary": source_summary[:260],
+        "source_excerpt": (source_excerpt or source_summary)[:260],
+        "call_site": call_site or {},
+        "why_relevant": why_relevant or reason,
         "reason": reason,
     }
 
@@ -128,6 +138,10 @@ def query_symbol_definition(name: str, path: str) -> str:
                 signature=item.signature,
                 source_summary=item.source,
                 reason="symbol definition candidate",
+                kind=item.kind,
+                summary=f"definition of {item.name}",
+                source_excerpt=item.source,
+                why_relevant=f"symbol name matched query '{symbol}'",
             )
             for item in matched[:20]
         ]
@@ -168,6 +182,15 @@ def query_callee_functions(file_path: str, function_name: str) -> str:
                 signature=item.signature,
                 source_summary=item.source,
                 reason=f"called by {owner.name}",
+                kind=item.kind,
+                summary=f"callee of {owner.name}",
+                source_excerpt=item.source,
+                call_site={
+                    "caller_file_path": owner.file,
+                    "caller_symbol_name": owner.name,
+                    "caller_line_range": [owner.start_line, owner.end_line],
+                },
+                why_relevant=f"{owner.name} contains call to {item.name}",
             )
             for item in callee_records[:30]
         ]
@@ -216,6 +239,13 @@ def query_caller_functions(file_path: str, function_name: str) -> str:
                 signature=item.signature,
                 source_summary=item.source,
                 reason=f"calls {target_name}",
+                kind=item.kind,
+                summary=f"caller of {target_name}",
+                source_excerpt=item.source,
+                call_site={
+                    "callee_symbol_name": target_name,
+                },
+                why_relevant=f"{item.name} contains call to {target_name}",
             )
             for item in callers[:30]
         ]
