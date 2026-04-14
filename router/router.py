@@ -1,11 +1,13 @@
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
+
+from pydantic import BaseModel, Field
+
 from services.lsp.server import LSPServer
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_PROMPT_FILE = PROJECT_ROOT / "PROMPT.md"
 DEFAULT_SKILL_DIR = PROJECT_ROOT / "skill"
 DEFAULT_IGNORES = {
     ".git",
@@ -54,24 +56,13 @@ DEFAULT_RULES: tuple[SkillRule, ...] = (
 )
 
 
-def _strip_frontmatter(raw: str) -> str:
-    text = raw.strip()
-    if not text.startswith("---"):
-        return text
-    parts = text.split("---", 2)
-    if len(parts) < 3:
-        return text
-    return parts[2].strip()
-
-
-def _read_markdown(path: Path) -> str:
-    if not path.exists() or not path.is_file():
-        return ""
-    try:
-        content = path.read_text(encoding="utf-8")
-    except Exception:
-        return ""
-    return _strip_frontmatter(content).strip()
+class PerceptionResult(BaseModel):
+    workspace_path: str
+    language_scores: dict[str, int] = Field(default_factory=dict)
+    skill_files: list[str] = Field(default_factory=list)
+    lsp_validation: dict[str, Any] = Field(default_factory=dict)
+    project_hints: dict[str, Any] = Field(default_factory=dict)
+    system_prompt: str = ""
 
 
 def _iter_source_files(workspace_path: Path, ignores: set[str]) -> Iterable[Path]:
@@ -142,22 +133,6 @@ def route_skill_files(
     return result
 
 
-def build_system_prompt(
-    workspace_path: str | Path,
-    base_prompt_file: str | Path = DEFAULT_PROMPT_FILE,
-    skill_dir: str | Path = DEFAULT_SKILL_DIR,
-    rules: Iterable[SkillRule] = DEFAULT_RULES,
-) -> str:
-    base = _read_markdown(Path(base_prompt_file).resolve())
-    skill_files = route_skill_files(workspace_path=workspace_path, skill_dir=skill_dir, rules=rules)
-    sections = [base] if base else []
-    for file_path in skill_files:
-        content = _read_markdown(file_path)
-        if content:
-            sections.append(content)
-    return "\n\n".join(part for part in sections if part).strip()
-
-
 def validate_workspace_lsp(
     workspace_path: str | Path,
     rules: Iterable[SkillRule] = DEFAULT_RULES,
@@ -217,25 +192,24 @@ def validate_workspace_lsp(
 
 def build_perception_result(
     workspace_path: str | Path,
-    base_prompt_file: str | Path = DEFAULT_PROMPT_FILE,
     skill_dir: str | Path = DEFAULT_SKILL_DIR,
     rules: Iterable[SkillRule] = DEFAULT_RULES,
 ) -> dict[str, Any]:
     snapshot = build_router_snapshot(workspace_path=workspace_path, skill_dir=skill_dir, rules=rules)
     lsp_validation = validate_workspace_lsp(workspace_path=workspace_path, rules=rules)
-    prompt = build_system_prompt(
-        workspace_path=workspace_path,
-        base_prompt_file=base_prompt_file,
-        skill_dir=skill_dir,
-        rules=rules,
+    result = PerceptionResult(
+        workspace_path=str(Path(workspace_path).resolve()),
+        language_scores=snapshot["language_scores"],
+        skill_files=snapshot["skill_files"],
+        lsp_validation=lsp_validation,
+        project_hints={
+            "language_scores": snapshot["language_scores"],
+            "skill_files": snapshot["skill_files"],
+            "lsp_checks": lsp_validation.get("checks", []) if isinstance(lsp_validation, dict) else [],
+        },
+        system_prompt="",
     )
-    return {
-        "workspace_path": str(Path(workspace_path).resolve()),
-        "language_scores": snapshot["language_scores"],
-        "skill_files": snapshot["skill_files"],
-        "lsp_validation": lsp_validation,
-        "system_prompt": prompt,
-    }
+    return result.model_dump()
 
 
 def build_router_snapshot(
@@ -258,7 +232,6 @@ __all__ = [
     "DEFAULT_RULES",
     "detect_languages",
     "route_skill_files",
-    "build_system_prompt",
     "validate_workspace_lsp",
     "build_perception_result",
     "build_router_snapshot",

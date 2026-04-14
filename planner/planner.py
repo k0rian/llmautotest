@@ -8,6 +8,7 @@ from typing import Any
 from langchain.agents import create_agent
 from langchain_openai import ChatOpenAI
 
+from llm_utils import parse_json_payload, read_text, resolve_workspace_target
 from llm_utils.config_loader import load_api_key
 from planner.policies import DEFAULT_BASE_URL, DEFAULT_MODEL_NAME
 from planner.prompt.loader import render_txt
@@ -23,7 +24,6 @@ from planner.state import (
     mark_step_failed,
     mark_step_running,
     record_failure_category,
-    read_text,
 )
 from planner.types import EvidenceItem, PlanStep, PlannerRunResult, PlannerRuntimeState, ToolExecutionRecord
 from planner.verifier import (
@@ -78,19 +78,7 @@ def _extract_text(payload: Any) -> str:
 
 
 def _parse_json_payload(text: str) -> dict[str, Any]:
-    raw = text.strip()
-    if raw.startswith("```"):
-        match = re.search(r"```(?:json)?\s*(.*?)```", raw, flags=re.DOTALL)
-        if match:
-            raw = match.group(1).strip()
-    try:
-        return json.loads(raw)
-    except json.JSONDecodeError:
-        start = raw.find("{")
-        end = raw.rfind("}")
-        if start >= 0 and end > start:
-            return json.loads(raw[start : end + 1])
-        raise
+    return parse_json_payload(text, strict=True)
 
 
 def _tool_description_text() -> str:
@@ -884,10 +872,9 @@ class PlanAndExecutePlanner:
             candidate = self._guess_target_path_from_text(objective) or self._guess_target_path_from_text(context)
         if not candidate:
             return workspace, ""
-        resolved = Path(candidate)
-        if not resolved.is_absolute():
-            resolved = Path(workspace) / resolved
-        resolved_str = str(resolved.resolve())
+        resolved_str, error = resolve_workspace_target(workspace, candidate)
+        if error:
+            return "", error
         try:
             WorkspaceGuard.ensure_under_workspace(workspace, resolved_str)
         except Exception:

@@ -258,8 +258,12 @@ class SemanticStateMachine:
                 continue
 
             definition = _parse_json_text(query_symbol_definition.func(name=fn_name, path=path))
-            callees = _parse_json_text(query_callee_functions.func(file_path=file_path, function_name=fn_name))
-            callers = _parse_json_text(query_caller_functions.func(file_path=file_path, function_name=fn_name))
+            callees = _parse_json_text(
+                query_callee_functions.func(file_path=file_path, function_name=fn_name, scope_path=path)
+            )
+            callers = _parse_json_text(
+                query_caller_functions.func(file_path=file_path, function_name=fn_name, scope_path=path)
+            )
             out.append(
                 {
                     "target": {"file_path": file_path, "symbol_name": fn_name},

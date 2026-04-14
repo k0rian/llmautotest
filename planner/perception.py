@@ -1,10 +1,12 @@
 import json
 import logging
+from pathlib import Path
 
 from router.router import build_perception_result
 
 from planner.policies import PROMPT_FILE
 from planner.types import AuditState
+from llm_utils import read_markdown
 
 LOGGER = logging.getLogger(__name__)
 
@@ -34,8 +36,8 @@ def _infer_semantic_intent(request: str) -> bool:
 
 
 def load_static_audit_prompt(workspace_path: str) -> str:
-    perception = build_perception_result(workspace_path=workspace_path, base_prompt_file=PROMPT_FILE)
-    prompt_text = str(perception.get("system_prompt", "")).strip()
+    _ = workspace_path
+    prompt_text = read_markdown(Path(PROMPT_FILE))
     if not prompt_text:
         LOGGER.error("Prompt file is empty or skill routing failed: %s", PROMPT_FILE)
         raise RuntimeError(f"Prompt file is empty or skill routing failed: {PROMPT_FILE}")
@@ -61,7 +63,7 @@ def perception_node(state: AuditState) -> AuditState:
         }
 
     try:
-        perception = build_perception_result(workspace_path=workspace_path, base_prompt_file=PROMPT_FILE)
+        perception = build_perception_result(workspace_path=workspace_path)
     except Exception as exc:
         return {
             "lsp_ready": False,
@@ -76,7 +78,6 @@ def perception_node(state: AuditState) -> AuditState:
             "audit_output": f"Perception stage failed: {exc}",
         }
 
-    prompt_text = str(perception.get("system_prompt", "")).strip()
     validation = perception.get("lsp_validation", {})
     checks = validation.get("checks", []) if isinstance(validation, dict) else []
     ready = bool(validation.get("ready", False)) if isinstance(validation, dict) else False
@@ -103,7 +104,7 @@ def perception_node(state: AuditState) -> AuditState:
     )
 
     result: AuditState = {
-        "skill_prompt": prompt_text,
+        "skill_prompt": load_static_audit_prompt(workspace_path),
         "perception_summary": summary,
         "lsp_ready": ready,
         "perception_meta": {
@@ -114,6 +115,7 @@ def perception_node(state: AuditState) -> AuditState:
                 "language_scores": scores,
                 "skill_files": skill_files,
                 "lsp_checks": checks,
+                "system_prompt_injected": False,
                 "semantic_intent": semantic_intent,
                 "semantic_fallback": not ready,
                 "execution_mode": "semantic_fallback" if not ready else "standard",

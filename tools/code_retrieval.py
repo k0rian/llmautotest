@@ -29,7 +29,7 @@ def _guess_workspace_from_file(file_path: str) -> Path:
     return path.parent
 
 
-def _load_function_records(root: Path) -> list[semantic_mod.FunctionRecord]:
+def _load_function_records(root: Path | str) -> list[semantic_mod.FunctionRecord]:
     include_glob = semantic_mod.DEFAULT_INCLUDE_GLOB
     index, _ = semantic_mod._get_or_create_index(
         path=str(root),
@@ -161,10 +161,10 @@ def query_symbol_definition(name: str, path: str) -> str:
 
 
 @tool
-def query_callee_functions(file_path: str, function_name: str) -> str:
+def query_callee_functions(file_path: str, function_name: str, scope_path: str = "") -> str:
     """Find direct callee functions from a given function."""
     try:
-        root = _guess_workspace_from_file(file_path)
+        root = Path(scope_path).resolve() if scope_path.strip() else _guess_workspace_from_file(file_path)
         records = _load_function_records(root)
         matched = _match_records(records, file_path=file_path, function_name=function_name)
         if not matched:
@@ -198,6 +198,7 @@ def query_callee_functions(file_path: str, function_name: str) -> str:
             {
                 "status": "ok",
                 "root": str(root),
+                "resolved_path": str(Path(scope_path).resolve()) if scope_path.strip() else str(Path(root).resolve()),
                 "owner": {
                     "file_path": owner.file,
                     "line_range": [owner.start_line, owner.end_line],
@@ -214,13 +215,13 @@ def query_callee_functions(file_path: str, function_name: str) -> str:
 
 
 @tool
-def query_caller_functions(file_path: str, function_name: str) -> str:
+def query_caller_functions(file_path: str, function_name: str, scope_path: str = "") -> str:
     """Find direct caller functions for a given function."""
     try:
         target_name = (function_name or "").strip()
         if not target_name:
             raise ValueError("function_name cannot be empty")
-        root = _guess_workspace_from_file(file_path)
+        root = Path(scope_path).resolve() if scope_path.strip() else _guess_workspace_from_file(file_path)
         records = _load_function_records(root)
         callers: list[semantic_mod.FunctionRecord] = []
         for item in records:
@@ -253,6 +254,7 @@ def query_caller_functions(file_path: str, function_name: str) -> str:
             {
                 "status": "ok",
                 "root": str(root),
+                "resolved_path": str(Path(scope_path).resolve()) if scope_path.strip() else str(Path(root).resolve()),
                 "target": target_name,
                 "callers": evidence,
             },

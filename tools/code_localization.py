@@ -190,7 +190,10 @@ def semantic_localize_requirement(path: str, requirement: str, top_k: int = 5) -
             {
                 "status": "ok",
                 "requirement": req,
-                "root": str(Path(path).resolve()),
+                "root": payload.get("root", str(Path(path).resolve())),
+                "resolved_path": payload.get("resolved_path", str(Path(path).resolve())),
+                "scope_type": payload.get("scope_type", "directory"),
+                "indexed_targets": payload.get("indexed_targets", []),
                 "localized_candidates": {
                     "directories": top_dirs,
                     "files": top_files,

@@ -7,6 +7,7 @@ from typing import Any
 
 from langchain.tools import tool
 
+from llm_utils import resolve_code_scope
 from tools import semantic_diff_ts as semantic_mod
 
 INDEX_VERSION = 2
@@ -27,9 +28,15 @@ def _node_id(kind: str, path: str, name: str = "", extra: str = "") -> str:
 
 
 def _cache_file(path: str, include_glob: str) -> Path:
-    root = Path(path).resolve()
-    cache_dir = root / semantic_mod.INDEX_CACHE_DIRNAME / semantic_mod.INDEX_CACHE_SUBDIR
-    digest = _sha1_text(f"{HIER_PREFIX}|{root}|{include_glob.lower()}")
+    scope = resolve_code_scope(
+        path=path,
+        include_glob=include_glob,
+        default_include_glob=semantic_mod.DEFAULT_INCLUDE_GLOB,
+        max_files=2000,
+        skip_dirs=semantic_mod.SKIP_DIRS,
+    )
+    cache_dir = Path(scope.index_root_path).resolve() / semantic_mod.INDEX_CACHE_DIRNAME / semantic_mod.INDEX_CACHE_SUBDIR
+    digest = _sha1_text(f"{HIER_PREFIX}|{scope.scope_type}|{scope.resolved_path}|{include_glob.lower()}")
     return cache_dir / f"{digest}.hier.json"
 
 
@@ -99,12 +106,17 @@ def _build_hierarchical_index_payload(
     max_files: int,
 ) -> dict[str, Any]:
     del use_llm  # reserved for future P2 upgrade
-    root = Path(path).resolve()
-    if not root.exists() or not root.is_dir():
-        raise ValueError(f"invalid directory path '{path}'")
+    scope = resolve_code_scope(
+        path=path,
+        include_glob=include_glob,
+        default_include_glob=semantic_mod.DEFAULT_INCLUDE_GLOB,
+        max_files=max_files,
+        skip_dirs=semantic_mod.SKIP_DIRS,
+    )
+    root = Path(scope.root_path)
 
-    files = semantic_mod._iter_code_files(root=root, include_glob=include_glob, max_files=max_files)
-    old_cache_path = _cache_file(str(root), include_glob)
+    files = [Path(item) for item in scope.target_files]
+    old_cache_path = _cache_file(path, include_glob)
     previous = _safe_read_json(old_cache_path) if old_cache_path.exists() and not rebuild else {}
     previous_nodes = previous.get("nodes", {}) if isinstance(previous.get("nodes", {}), dict) else {}
     previous_meta = previous.get("artifacts", {}) if isinstance(previous.get("artifacts", {}), dict) else {}
@@ -302,9 +314,12 @@ def _build_hierarchical_index_payload(
     payload = {
         "version": INDEX_VERSION,
         "root": repo_path,
+        "resolved_path": scope.resolved_path,
+        "scope_type": scope.scope_type,
         "created_at": _utc_now(),
         "updated_at": _utc_now(),
         "include_glob": include_glob,
+        "indexed_targets": [str(item.resolve()) for item in files],
         "nodes": nodes,
         "edges": edges,
         "stats": {
@@ -356,7 +371,10 @@ def build_hierarchical_code_index(
             {
                 "status": "ok",
                 "root": payload.get("root", ""),
+                "resolved_path": payload.get("resolved_path", ""),
+                "scope_type": payload.get("scope_type", "directory"),
                 "version": payload.get("version", INDEX_VERSION),
+                "indexed_targets": payload.get("indexed_targets", []),
                 "stats": payload.get("stats", {}),
                 "cache_path": payload.get("artifacts", {}).get("cache_path", ""),
             },

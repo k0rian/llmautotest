@@ -2,18 +2,18 @@
 import json
 import hashlib
 import math
-import os
 import re
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from fnmatch import fnmatch
 from pathlib import Path
 from typing import Any, Callable
 
 from langchain.tools import tool
 from tree_sitter import Node, Parser, Query, QueryCursor
 import tree_sitter_language_pack as ts_pack
+
+from llm_utils import iter_code_files, normalize_include_glob as normalize_scope_glob, resolve_code_scope
 
 
 SKIP_DIRS = {
@@ -152,10 +152,13 @@ class FunctionRecord:
 @dataclass
 class SemanticIndex:
     root: str
+    resolved_path: str
+    scope_type: str
     include_glob: str
     created_at: str
     file_count: int
     function_count: int
+    target_files: list[str]
     functions: list[FunctionRecord]
     idf: dict[str, float]
     parser_status: dict[str, str]
@@ -171,27 +174,30 @@ _PARSER_ERRORS: dict[str, str] = {}
 _QUERY_CACHE: dict[str, Query] = {}
 
 
-def _cache_key(root: str, include_glob: str) -> str:
-    return f"{Path(root).resolve()}::{include_glob.strip().lower()}"
+def _cache_key(scope_type: str, resolved_path: str, include_glob: str) -> str:
+    return f"{scope_type}::{Path(resolved_path).resolve()}::{include_glob.strip().lower()}"
 
 
-def _index_cache_dir(path: str) -> Path:
-    return Path(path).resolve() / INDEX_CACHE_DIRNAME / INDEX_CACHE_SUBDIR
+def _index_cache_dir(index_root_path: str) -> Path:
+    return Path(index_root_path).resolve() / INDEX_CACHE_DIRNAME / INDEX_CACHE_SUBDIR
 
 
-def _index_cache_file(path: str, include_glob: str) -> Path:
-    digest = hashlib.sha1(_cache_key(path, include_glob).encode("utf-8")).hexdigest()
-    return _index_cache_dir(path) / f"{digest}.json"
+def _index_cache_file(index_root_path: str, scope_type: str, resolved_path: str, include_glob: str) -> Path:
+    digest = hashlib.sha1(_cache_key(scope_type, resolved_path, include_glob).encode("utf-8")).hexdigest()
+    return _index_cache_dir(index_root_path) / f"{digest}.json"
 
 
 def _index_to_payload(index: SemanticIndex) -> dict[str, Any]:
     return {
         "version": 1,
         "root": index.root,
+        "resolved_path": index.resolved_path,
+        "scope_type": index.scope_type,
         "include_glob": index.include_glob,
         "created_at": index.created_at,
         "file_count": index.file_count,
         "function_count": index.function_count,
+        "target_files": index.target_files,
         "idf": index.idf,
         "parser_status": index.parser_status,
         "parser_errors": index.parser_errors,
@@ -264,10 +270,13 @@ def _index_from_payload(payload: dict[str, Any]) -> SemanticIndex:
 
     return SemanticIndex(
         root=str(payload.get("root", "")),
+        resolved_path=str(payload.get("resolved_path", payload.get("root", ""))),
+        scope_type=str(payload.get("scope_type", "directory")),
         include_glob=str(payload.get("include_glob", DEFAULT_INCLUDE_GLOB)),
         created_at=str(payload.get("created_at", "")),
         file_count=int(payload.get("file_count", 0) or 0),
         function_count=int(payload.get("function_count", len(functions)) or len(functions)),
+        target_files=[str(item) for item in payload.get("target_files", []) if str(item).strip()],
         functions=functions,
         idf=idf,
         parser_status=parser_status,
@@ -277,22 +286,34 @@ def _index_from_payload(payload: dict[str, Any]) -> SemanticIndex:
     )
 
 
-def _save_index_to_disk(path: str, include_glob: str, index: SemanticIndex) -> None:
-    cache_file = _index_cache_file(path=path, include_glob=include_glob)
+def _save_index_to_disk(scope: Any, include_glob: str, index: SemanticIndex) -> None:
+    cache_file = _index_cache_file(
+        index_root_path=scope.index_root_path,
+        scope_type=scope.scope_type,
+        resolved_path=scope.resolved_path,
+        include_glob=include_glob,
+    )
     cache_file.parent.mkdir(parents=True, exist_ok=True)
     payload = _index_to_payload(index)
     cache_file.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
 
 
-def _load_index_from_disk(path: str, include_glob: str) -> SemanticIndex | None:
-    cache_file = _index_cache_file(path=path, include_glob=include_glob)
+def _load_index_from_disk(scope: Any, include_glob: str) -> SemanticIndex | None:
+    cache_file = _index_cache_file(
+        index_root_path=scope.index_root_path,
+        scope_type=scope.scope_type,
+        resolved_path=scope.resolved_path,
+        include_glob=include_glob,
+    )
     if not cache_file.exists() or not cache_file.is_file():
         return None
     try:
         payload = json.loads(cache_file.read_text(encoding="utf-8"))
         if not isinstance(payload, dict):
             return None
-        if str(payload.get("root", "")).strip() != str(Path(path).resolve()):
+        if str(payload.get("resolved_path", payload.get("root", ""))).strip() != scope.resolved_path:
+            return None
+        if str(payload.get("scope_type", "")).strip() != scope.scope_type:
             return None
         if str(payload.get("include_glob", "")).strip().lower() != include_glob.strip().lower():
             return None
@@ -302,8 +323,7 @@ def _load_index_from_disk(path: str, include_glob: str) -> SemanticIndex | None:
 
 
 def _normalize_include_glob(include_glob: str) -> list[str]:
-    raw = include_glob.strip() or DEFAULT_INCLUDE_GLOB
-    return [part.strip() for part in raw.split(",") if part.strip()]
+    return normalize_scope_glob(include_glob, DEFAULT_INCLUDE_GLOB)
 
 
 def _is_code_file(path: Path, patterns: list[str]) -> bool:
@@ -312,21 +332,12 @@ def _is_code_file(path: Path, patterns: list[str]) -> bool:
 
 def _iter_code_files(root: Path, include_glob: str, max_files: int) -> list[Path]:
     patterns = _normalize_include_glob(include_glob)
-    files: list[Path] = []
-    for current_root, dirs, names in os.walk(root):
-        dirs[:] = [item for item in dirs if item not in SKIP_DIRS]
-        for name in names:
-            full = Path(current_root) / name
-            if not _is_code_file(full, patterns):
-                continue
-            if not full.exists():
-                continue
-            if full.stat().st_size > MAX_FILE_BYTES:
-                continue
-            files.append(full)
-            if len(files) >= max_files:
-                return files
-    return files
+    files = iter_code_files(root=root, patterns=patterns, max_files=max_files, skip_dirs=SKIP_DIRS)
+    return [
+        full
+        for full in files
+        if full.exists() and full.stat().st_size <= MAX_FILE_BYTES and _is_code_file(full, patterns)
+    ]
 
 
 def _split_identifier(text: str) -> list[str]:
@@ -809,11 +820,22 @@ def _status_by_score(score: float) -> str:
 
 def _build_index(path: str, include_glob: str, max_files: int) -> SemanticIndex:
     try:
-        root = Path(path).resolve()
-        if not root.exists() or not root.is_dir():
-            raise ValueError(f"invalid directory path '{path}'")
-
-        file_paths = _iter_code_files(root=root, include_glob=include_glob, max_files=max_files)
+        scope = resolve_code_scope(
+            path=path,
+            include_glob=include_glob,
+            default_include_glob=DEFAULT_INCLUDE_GLOB,
+            max_files=max_files,
+            skip_dirs=SKIP_DIRS,
+        )
+        file_paths = [Path(item) for item in scope.target_files]
+        filtered_file_paths: list[Path] = []
+        for file_path in file_paths:
+            if not file_path.exists() or not file_path.is_file():
+                continue
+            if file_path.stat().st_size > MAX_FILE_BYTES:
+                continue
+            filtered_file_paths.append(file_path)
+        file_paths = filtered_file_paths
         indexed_files_by_language: dict[str, int] = defaultdict(int)
         strict_languages_in_scope: set[str] = set()
         for file_path in file_paths:
@@ -884,11 +906,14 @@ def _build_index(path: str, include_glob: str, max_files: int) -> SemanticIndex:
         }
 
         return SemanticIndex(
-            root=str(root),
-            include_glob=include_glob,
+            root=scope.root_path,
+            resolved_path=scope.resolved_path,
+            scope_type=scope.scope_type,
+            include_glob=scope.include_glob,
             created_at=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
             file_count=len(file_paths),
             function_count=len(function_records),
+            target_files=[str(item.resolve()) for item in file_paths],
             functions=function_records,
             idf=idf,
             parser_status=parser_status,
@@ -904,17 +929,24 @@ def _build_index(path: str, include_glob: str, max_files: int) -> SemanticIndex:
 
 
 def _get_or_create_index(path: str, include_glob: str, max_files: int, rebuild: bool) -> tuple[SemanticIndex, bool]:
-    key = _cache_key(path, include_glob)
+    scope = resolve_code_scope(
+        path=path,
+        include_glob=include_glob,
+        default_include_glob=DEFAULT_INCLUDE_GLOB,
+        max_files=max_files,
+        skip_dirs=SKIP_DIRS,
+    )
+    key = _cache_key(scope.scope_type, scope.resolved_path, scope.include_glob)
     if not rebuild and key in _INDEX_CACHE:
         return _INDEX_CACHE[key], True
     if not rebuild:
-        disk_cached = _load_index_from_disk(path=path, include_glob=include_glob)
+        disk_cached = _load_index_from_disk(scope=scope, include_glob=scope.include_glob)
         if disk_cached is not None:
             _INDEX_CACHE[key] = disk_cached
             return disk_cached, True
-    index = _build_index(path=path, include_glob=include_glob, max_files=max_files)
+    index = _build_index(path=path, include_glob=scope.include_glob, max_files=max_files)
     _INDEX_CACHE[key] = index
-    _save_index_to_disk(path=path, include_glob=include_glob, index=index)
+    _save_index_to_disk(scope=scope, include_glob=scope.include_glob, index=index)
     return index, False
 
 
@@ -947,12 +979,22 @@ def semantic_index_functions(
         return {
             "status": "ok",
             "root": index.root,
+            "resolved_path": index.resolved_path,
+            "scope_type": index.scope_type,
             "include_glob": index.include_glob,
             "created_at": index.created_at,
             "file_count": index.file_count,
             "function_count": index.function_count,
             "cache_hit": cache_hit,
-            "cache_path": str(_index_cache_file(path=path, include_glob=include_glob)),
+            "indexed_targets": index.target_files,
+            "cache_path": str(
+                _index_cache_file(
+                    index_root_path=index.root if index.scope_type == "directory" else index.root,
+                    scope_type=index.scope_type,
+                    resolved_path=index.resolved_path,
+                    include_glob=index.include_glob,
+                )
+            ),
             "parser_languages": sorted(_PARSER_FACTORIES.keys()),
             "parser_status": index.parser_status,
             "parser_errors": index.parser_errors,
@@ -985,8 +1027,11 @@ def semantic_search_functions(
             "status": "ok",
             "query": query,
             "root": index.root,
+            "resolved_path": index.resolved_path,
+            "scope_type": index.scope_type,
             "function_count": index.function_count,
             "top_k": top_k,
+            "indexed_targets": index.target_files,
             "hits": hits,
         }
 
@@ -1063,7 +1108,10 @@ def semantic_diff_with_description(
         return {
             "status": "ok",
             "root": index.root,
+            "resolved_path": index.resolved_path,
+            "scope_type": index.scope_type,
             "include_glob": index.include_glob,
+            "indexed_targets": index.target_files,
             "index": {
                 "created_at": index.created_at,
                 "file_count": index.file_count,
