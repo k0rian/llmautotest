@@ -14,6 +14,7 @@ from tools.shell import run_shell_command
 from tools.semantic_diff_ts import (
     semantic_diff_with_description,
     semantic_index_functions,
+    semantic_lookup_function_name,
     semantic_search_functions,
 )
 from tools.code_index import build_hierarchical_code_index
@@ -65,6 +66,7 @@ def _tool_registry() -> dict[str, Any]:
         "run_shell_command": run_shell_command,
         "semantic_index_functions": semantic_index_functions,
         "semantic_search_functions": semantic_search_functions,
+        "semantic_lookup_function_name": semantic_lookup_function_name,
         "semantic_diff_with_description": semantic_diff_with_description,
         "build_hierarchical_code_index": build_hierarchical_code_index,
         "semantic_localize_requirement": semantic_localize_requirement,

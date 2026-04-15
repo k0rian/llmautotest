@@ -6,6 +6,7 @@ import re
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from fnmatch import fnmatch
 from pathlib import Path
 from typing import Any, Callable
 
@@ -153,6 +154,7 @@ class FunctionRecord:
 class SemanticIndex:
     root: str
     resolved_path: str
+    target_path: str
     scope_type: str
     include_glob: str
     created_at: str
@@ -160,6 +162,7 @@ class SemanticIndex:
     function_count: int
     target_files: list[str]
     functions: list[FunctionRecord]
+    function_name_index: dict[str, list[dict[str, Any]]]
     idf: dict[str, float]
     parser_status: dict[str, str]
     parser_errors: dict[str, str]
@@ -192,12 +195,14 @@ def _index_to_payload(index: SemanticIndex) -> dict[str, Any]:
         "version": 1,
         "root": index.root,
         "resolved_path": index.resolved_path,
+        "target_path": index.target_path,
         "scope_type": index.scope_type,
         "include_glob": index.include_glob,
         "created_at": index.created_at,
         "file_count": index.file_count,
         "function_count": index.function_count,
         "target_files": index.target_files,
+        "function_name_index": index.function_name_index,
         "idf": index.idf,
         "parser_status": index.parser_status,
         "parser_errors": index.parser_errors,
@@ -267,10 +272,18 @@ def _index_from_payload(payload: dict[str, Any]) -> SemanticIndex:
     )
     raw_idf = payload.get("idf", {})
     idf = {str(k): float(v) for k, v in raw_idf.items()} if isinstance(raw_idf, dict) else {}
+    raw_name_index = payload.get("function_name_index", {})
+    function_name_index: dict[str, list[dict[str, Any]]] = {}
+    if isinstance(raw_name_index, dict):
+        for key, items in raw_name_index.items():
+            if not isinstance(items, list):
+                continue
+            function_name_index[str(key)] = [item for item in items if isinstance(item, dict)]
 
     return SemanticIndex(
         root=str(payload.get("root", "")),
         resolved_path=str(payload.get("resolved_path", payload.get("root", ""))),
+        target_path=str(payload.get("target_path", payload.get("resolved_path", payload.get("root", "")))),
         scope_type=str(payload.get("scope_type", "directory")),
         include_glob=str(payload.get("include_glob", DEFAULT_INCLUDE_GLOB)),
         created_at=str(payload.get("created_at", "")),
@@ -278,6 +291,7 @@ def _index_from_payload(payload: dict[str, Any]) -> SemanticIndex:
         function_count=int(payload.get("function_count", len(functions)) or len(functions)),
         target_files=[str(item) for item in payload.get("target_files", []) if str(item).strip()],
         functions=functions,
+        function_name_index=function_name_index,
         idf=idf,
         parser_status=parser_status,
         parser_errors=parser_errors,
@@ -756,6 +770,32 @@ def _cosine_similarity(v1: dict[str, float], n1: float, v2: dict[str, float], n2
     return dot / (n1 * n2)
 
 
+def _normalize_function_name(name: str) -> str:
+    return (name or "").strip().lower()
+
+
+def _build_function_name_index(records: list[FunctionRecord]) -> dict[str, list[dict[str, Any]]]:
+    index: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for item in records:
+        norm = _normalize_function_name(item.name)
+        if not norm:
+            continue
+        index[norm].append(
+            {
+                "name": item.name,
+                "kind": item.kind,
+                "signature": item.signature,
+                "file": item.file,
+                "language": item.language,
+                "start_line": item.start_line,
+                "end_line": item.end_line,
+            }
+        )
+    for value in index.values():
+        value.sort(key=lambda row: (str(row.get("file", "")), int(row.get("start_line", 0) or 0)))
+    return dict(index)
+
+
 def _search_functions(index: SemanticIndex, query: str, top_k: int) -> list[dict[str, Any]]:
     query_vector, query_norm = _vectorize_query(query, index.idf)
     scored: list[tuple[float, FunctionRecord]] = []
@@ -782,6 +822,20 @@ def _search_functions(index: SemanticIndex, query: str, top_k: int) -> list[dict
             }
         )
     return result
+
+
+def _lookup_function_name(index: SemanticIndex, name: str, exact: bool, top_k: int) -> list[dict[str, Any]]:
+    normalized = _normalize_function_name(name)
+    if not normalized:
+        return []
+    candidates: list[dict[str, Any]] = []
+    if exact:
+        candidates = list(index.function_name_index.get(normalized, []))
+    else:
+        for key, items in index.function_name_index.items():
+            if normalized in key:
+                candidates.extend(items)
+    return candidates[: max(1, min(int(top_k), 100))]
 
 
 def _read_description_text(description: str, description_file: str) -> str:
@@ -820,6 +874,9 @@ def _status_by_score(score: float) -> str:
 
 def _build_index(path: str, include_glob: str, max_files: int) -> SemanticIndex:
     try:
+        root = Path(path).resolve()
+        if not root.exists():
+            raise ValueError(f"path not found: {path}")
         scope = resolve_code_scope(
             path=path,
             include_glob=include_glob,
@@ -827,7 +884,10 @@ def _build_index(path: str, include_glob: str, max_files: int) -> SemanticIndex:
             max_files=max_files,
             skip_dirs=SKIP_DIRS,
         )
-        file_paths = [Path(item) for item in scope.target_files]
+        if root.is_file():
+            file_paths = [root]
+        else:
+            file_paths = [Path(item) for item in scope.target_files]
         filtered_file_paths: list[Path] = []
         for file_path in file_paths:
             if not file_path.exists() or not file_path.is_file():
@@ -908,6 +968,7 @@ def _build_index(path: str, include_glob: str, max_files: int) -> SemanticIndex:
         return SemanticIndex(
             root=scope.root_path,
             resolved_path=scope.resolved_path,
+            target_path=scope.resolved_path,
             scope_type=scope.scope_type,
             include_glob=scope.include_glob,
             created_at=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
@@ -915,6 +976,7 @@ def _build_index(path: str, include_glob: str, max_files: int) -> SemanticIndex:
             function_count=len(function_records),
             target_files=[str(item.resolve()) for item in file_paths],
             functions=function_records,
+            function_name_index=_build_function_name_index(function_records),
             idf=idf,
             parser_status=parser_status,
             parser_errors=parser_errors,
@@ -980,11 +1042,13 @@ def semantic_index_functions(
             "status": "ok",
             "root": index.root,
             "resolved_path": index.resolved_path,
+            "target_path": index.target_path,
             "scope_type": index.scope_type,
             "include_glob": index.include_glob,
             "created_at": index.created_at,
             "file_count": index.file_count,
             "function_count": index.function_count,
+            "function_name_count": len(index.function_name_index),
             "cache_hit": cache_hit,
             "indexed_targets": index.target_files,
             "cache_path": str(
@@ -1028,6 +1092,7 @@ def semantic_search_functions(
             "query": query,
             "root": index.root,
             "resolved_path": index.resolved_path,
+            "target_path": index.target_path,
             "scope_type": index.scope_type,
             "function_count": index.function_count,
             "top_k": top_k,
@@ -1036,6 +1101,42 @@ def semantic_search_functions(
         }
 
     return _execute_tool(_handler, "semantic_search_functions")
+
+
+@tool
+def semantic_lookup_function_name(
+    name: str,
+    path: str,
+    exact: bool = True,
+    top_k: int = 20,
+    include_glob: str = DEFAULT_INCLUDE_GLOB,
+    max_files: int = 2000,
+    rebuild: bool = False,
+) -> str:
+    """
+    Lookup indexed functions by function name using the function-name index.
+    """
+
+    def _handler() -> dict[str, Any]:
+        if not name.strip():
+            raise ValueError("name cannot be empty")
+        index, _ = _get_or_create_index(path=path, include_glob=include_glob, max_files=max_files, rebuild=rebuild)
+        matches = _lookup_function_name(index=index, name=name, exact=bool(exact), top_k=top_k)
+        return {
+            "status": "ok",
+            "query": name,
+            "exact": bool(exact),
+            "root": index.root,
+            "resolved_path": index.resolved_path,
+            "target_path": index.target_path,
+            "scope_type": index.scope_type,
+            "indexed_targets": index.target_files,
+            "function_name_count": len(index.function_name_index),
+            "match_count": len(matches),
+            "matches": matches,
+        }
+
+    return _execute_tool(_handler, "semantic_lookup_function_name")
 
 
 @tool
@@ -1109,6 +1210,7 @@ def semantic_diff_with_description(
             "status": "ok",
             "root": index.root,
             "resolved_path": index.resolved_path,
+            "target_path": index.target_path,
             "scope_type": index.scope_type,
             "include_glob": index.include_glob,
             "indexed_targets": index.target_files,

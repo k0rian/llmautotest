@@ -47,6 +47,10 @@ TOOL_DESCRIPTIONS = {
         "category": "semantic",
         "description": "- Semantic retrieve functions by natural language query\n- Returns most relevant functions with score and location\n- Suitable for mapping requirement text to implementation points",
     },
+    "semantic_lookup_function_name": {
+        "category": "semantic",
+        "description": "- Lookup indexed functions by exact or fuzzy function name\n- Uses the function-name index built during semantic indexing\n- Returns file, line range, signature, and language for matched names",
+    },
     "semantic_diff_with_description": {
         "category": "semantic",
         "description": "- Compare implementation with user description (PRD/API docs)\n- Generates coverage summary: covered/partial/missing requirements\n- Also lists potentially undocumented functions",
