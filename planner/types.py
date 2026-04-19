@@ -102,6 +102,8 @@ class PlannerRuntimeState:
     latest_failure_category: str = ""
     semantic_required: bool = False
     semantic_target_hint: str = ""
+    semantic_use_llm_summary: bool = False
+    semantic_summary_model: str = ""
     semantic_context: dict[str, Any] | None = None
     status: RuntimeStatus = "running"
 
@@ -120,6 +122,8 @@ class PlannerRuntimeState:
             "latest_failure_category": self.latest_failure_category,
             "semantic_required": self.semantic_required,
             "semantic_target_hint": self.semantic_target_hint,
+            "semantic_use_llm_summary": self.semantic_use_llm_summary,
+            "semantic_summary_model": self.semantic_summary_model,
             "semantic_context": dict(self.semantic_context or {}),
             "status": self.status,
         }

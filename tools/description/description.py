@@ -41,7 +41,7 @@ TOOL_DESCRIPTIONS = {
     },
     "semantic_index_functions": {
         "category": "semantic",
-        "description": "- Build function-level semantic index for codebase\n- Extracts Python/JS/TS/C/C++ functions and vectorizes signatures/docs/source\n- Supports .py/.js/.jsx/.ts/.tsx/.c/.h/.cc/.cpp/.hpp\n- Use this before large-scale semantic retrieval tasks",
+        "description": "- Build function-level semantic index for codebase\n- Extracts Python/JS/TS/Go/C/C++ functions and vectorizes signatures/docs/source\n- Optionally set use_llm_summary=true to include LLM-generated function summaries\n- Supports .py/.js/.jsx/.ts/.tsx/.go/.c/.h/.cc/.cpp/.hpp\n- Use this before large-scale semantic retrieval tasks",
     },
     "semantic_search_functions": {
         "category": "semantic",

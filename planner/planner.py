@@ -9,7 +9,7 @@ from langchain.agents import create_agent
 from langchain_openai import ChatOpenAI
 
 from llm_utils import parse_json_payload, read_text, resolve_workspace_target
-from llm_utils.config_loader import load_api_key
+from llm_utils.config_loader import load_api_key, load_base_url, load_model_name
 from planner.policies import DEFAULT_BASE_URL, DEFAULT_MODEL_NAME
 from planner.prompt.loader import render_txt
 from planner.state import (
@@ -54,12 +54,12 @@ SEMANTIC_MODE_ALIASES = {
 
 
 def build_planner_model(
-    model_name: str = DEFAULT_MODEL_NAME,
-    base_url: str = DEFAULT_BASE_URL,
+    model_name: str = "",
+    base_url: str = "",
 ) -> ChatOpenAI:
     return ChatOpenAI(
-        model=model_name,
-        base_url=base_url,
+        model=model_name or load_model_name(DEFAULT_MODEL_NAME),
+        base_url=base_url or load_base_url() or DEFAULT_BASE_URL,
         api_key=load_api_key(),
     )
 
@@ -158,6 +158,8 @@ class PlanAndExecutePlanner:
         workspace_path = read_text(inputs.get("workspace_path", "")).strip()
         semantic_required = bool(inputs.get("semantic_required", False))
         semantic_target_hint = read_text(inputs.get("semantic_target_hint", "")).strip()
+        semantic_use_llm_summary = bool(inputs.get("semantic_use_llm_summary", False))
+        semantic_summary_model = read_text(inputs.get("semantic_summary_model", "")).strip()
         result = self.execute(
             objective=objective,
             context=context,
@@ -165,6 +167,8 @@ class PlanAndExecutePlanner:
             workspace_path=workspace_path,
             semantic_required=semantic_required,
             semantic_target_hint=semantic_target_hint,
+            semantic_use_llm_summary=semantic_use_llm_summary,
+            semantic_summary_model=semantic_summary_model,
         )
         return result.to_dict()
 
@@ -204,6 +208,8 @@ class PlanAndExecutePlanner:
         workspace_path: str = "",
         semantic_required: bool = False,
         semantic_target_hint: str = "",
+        semantic_use_llm_summary: bool = False,
+        semantic_summary_model: str = "",
     ) -> PlannerRunResult:
         if not objective or not objective.strip():
             empty_state = create_runtime_state(objective="", context=context, summary="", steps=[])
@@ -234,6 +240,8 @@ class PlanAndExecutePlanner:
             steps=steps,
             semantic_required=semantic_required,
             semantic_target_hint=semantic_target_hint,
+            semantic_use_llm_summary=semantic_use_llm_summary,
+            semantic_summary_model=semantic_summary_model,
         )
 
         while True:
@@ -361,6 +369,8 @@ class PlanAndExecutePlanner:
                 step=step,
                 history=history,
                 workspace_path=workspace_path,
+                use_llm_summary=runtime_state.semantic_use_llm_summary,
+                summary_model_name=runtime_state.semantic_summary_model,
             )
             lowered = text.lower()
             error_stage = read_text(structured_output.get("error_stage", "")).strip().lower()
@@ -684,6 +694,8 @@ class PlanAndExecutePlanner:
         step: PlanStep,
         history: list[PlanStep],
         workspace_path: str,
+        use_llm_summary: bool = False,
+        summary_model_name: str = "",
     ) -> tuple[str, dict[str, Any]]:
         resolved_workspace = workspace_path.strip() or self._extract_workspace_path_from_context(context)
         if not resolved_workspace:
@@ -737,6 +749,8 @@ class PlanAndExecutePlanner:
                 semantic_index_functions,
                 path=target_path,
                 rebuild=False,
+                use_llm_summary=bool(use_llm_summary),
+                summary_model_name=summary_model_name,
             )
             index_text = read_text(index_result).strip()
             diff_result = _invoke_tool_callable(
@@ -744,6 +758,8 @@ class PlanAndExecutePlanner:
                 path=target_path,
                 description=description,
                 rebuild=False,
+                use_llm_summary=bool(use_llm_summary),
+                summary_model_name=summary_model_name,
             )
             diff_text = read_text(diff_result).strip()
             index_data = self._safe_parse_json(index_text)
@@ -885,15 +901,22 @@ class PlanAndExecutePlanner:
         source = (text or "").strip()
         if not source:
             return ""
+        path_token = (
+            r"(?:"
+            r"(?:[A-Za-z]:)?(?:[\\/][A-Za-z0-9_.\-]+)+(?:[\\/])?"
+            r"|"
+            r"[A-Za-z0-9_.\-]+(?:[\\/][A-Za-z0-9_.\-]+)+(?:[\\/])?"
+            r")"
+        )
         patterns = (
-            r"([A-Za-z0-9_\-./\\]+[/\\])",
-            r"(?:in|under)\s+([A-Za-z0-9_\-./\\]+)",
+            rf"({path_token})",
+            rf"(?:in|under)\s+({path_token})",
         )
         for pattern in patterns:
             match = re.search(pattern, source, flags=re.IGNORECASE)
             if not match:
                 continue
-            token = match.group(1).strip().strip("`'\"")
+            token = match.group(1).strip().strip("`'\"").rstrip(".,;:)")
             if token and any(sep in token for sep in ("/", "\\")):
                 return token
         return ""

@@ -45,15 +45,31 @@ class SemanticAgent:
             requirement = "semantic requirement"
 
         if mode == "semantic_index":
+            use_llm_summary = bool(runtime_state.semantic_use_llm_summary)
+            summary_model = runtime_state.semantic_summary_model
             result = _parse_json_text(
-                build_hierarchical_code_index.func(path=target_path, rebuild=False, use_llm=False)
+                build_hierarchical_code_index.func(
+                    path=target_path,
+                    rebuild=False,
+                    use_llm=use_llm_summary,
+                    summary_model_name=summary_model,
+                )
             )
-            cache = load_hierarchical_code_index(target_path)
+            cache = load_hierarchical_code_index(
+                target_path,
+                use_llm=use_llm_summary,
+                summary_model_name=summary_model,
+            )
             fallback = {}
             index_success = result.get("status") == "ok"
             if not index_success:
                 fallback = _parse_json_text(
-                    semantic_index_functions.func(path=target_path, rebuild=False)
+                    semantic_index_functions.func(
+                        path=target_path,
+                        rebuild=False,
+                        use_llm_summary=use_llm_summary,
+                        summary_model_name=summary_model,
+                    )
                 )
             context.update(
                 {
@@ -63,6 +79,8 @@ class SemanticAgent:
                     "index_result": result,
                     "index_stats": cache.get("stats", {}),
                     "index_fallback": fallback,
+                    "use_llm_summary": use_llm_summary,
+                    "summary_model": summary_model,
                 }
             )
             summary = (
@@ -70,6 +88,7 @@ class SemanticAgent:
                 f"- root: {result.get('root', '') or target_path}\n"
                 f"- cache_path: {result.get('cache_path', '')}\n"
                 f"- stats: {json.dumps(result.get('stats', {}), ensure_ascii=False)}\n"
+                f"- use_llm_summary: {use_llm_summary}\n"
                 f"- fallback_used: {bool(fallback)}"
             )
             return summary, {
@@ -78,12 +97,20 @@ class SemanticAgent:
                 "root": result.get("root", target_path),
                 "cache_path": result.get("cache_path", ""),
                 "stats": result.get("stats", {}),
+                "use_llm_summary": use_llm_summary,
+                "summary_model": summary_model,
                 "requirement": requirement,
                 "fallback": fallback,
             }
 
         if mode == "semantic_localize":
-            localized = self.state_machine.localize(path=target_path, requirement=requirement, top_k=5)
+            localized = self.state_machine.localize(
+                path=target_path,
+                requirement=requirement,
+                top_k=5,
+                use_llm_summary=runtime_state.semantic_use_llm_summary,
+                summary_model_name=runtime_state.semantic_summary_model,
+            )
             detect = self.state_machine.detect(requirement=requirement, localized=localized, retrieved=[])
             context.update(
                 {
@@ -122,16 +149,40 @@ class SemanticAgent:
         if mode == "semantic_retrieve":
             localized = context.get("localized", {}) if isinstance(context.get("localized"), dict) else {}
             if not localized:
-                localized = self.state_machine.localize(path=target_path, requirement=requirement, top_k=5)
+                localized = self.state_machine.localize(
+                    path=target_path,
+                    requirement=requirement,
+                    top_k=5,
+                    use_llm_summary=runtime_state.semantic_use_llm_summary,
+                    summary_model_name=runtime_state.semantic_summary_model,
+                )
                 context["localized"] = localized
 
             detect_1 = self.state_machine.detect(requirement=requirement, localized=localized, retrieved=[])
-            retrieved = self.state_machine.retrieve(path=target_path, localized=localized, top_k=3)
+            retrieved = self.state_machine.retrieve(
+                path=target_path,
+                localized=localized,
+                top_k=3,
+                use_llm_summary=runtime_state.semantic_use_llm_summary,
+                summary_model_name=runtime_state.semantic_summary_model,
+            )
             if not retrieved:
-                fallback_localized = self.state_machine.localize(path=target_path, requirement=requirement, top_k=12)
+                fallback_localized = self.state_machine.localize(
+                    path=target_path,
+                    requirement=requirement,
+                    top_k=12,
+                    use_llm_summary=runtime_state.semantic_use_llm_summary,
+                    summary_model_name=runtime_state.semantic_summary_model,
+                )
                 localized = fallback_localized or localized
                 context["localized"] = localized
-                retrieved = self.state_machine.retrieve(path=target_path, localized=localized, top_k=8)
+                retrieved = self.state_machine.retrieve(
+                    path=target_path,
+                    localized=localized,
+                    top_k=8,
+                    use_llm_summary=runtime_state.semantic_use_llm_summary,
+                    summary_model_name=runtime_state.semantic_summary_model,
+                )
 
             evidence = self.state_machine.build_validation_evidence(localized=localized, retrieved=retrieved)
             detect_2 = self.state_machine.detect(requirement=requirement, localized=localized, retrieved=retrieved)
@@ -175,9 +226,21 @@ class SemanticAgent:
             prelim_obj = context.get("preliminary_finding", {}) if isinstance(context.get("preliminary_finding"), dict) else {}
             preliminary = str(prelim_obj.get("preliminary_finding", "unknown"))
             if not localized:
-                localized = self.state_machine.localize(path=target_path, requirement=requirement, top_k=5)
+                localized = self.state_machine.localize(
+                    path=target_path,
+                    requirement=requirement,
+                    top_k=5,
+                    use_llm_summary=runtime_state.semantic_use_llm_summary,
+                    summary_model_name=runtime_state.semantic_summary_model,
+                )
             if not retrieved:
-                retrieved = self.state_machine.retrieve(path=target_path, localized=localized, top_k=3)
+                retrieved = self.state_machine.retrieve(
+                    path=target_path,
+                    localized=localized,
+                    top_k=3,
+                    use_llm_summary=runtime_state.semantic_use_llm_summary,
+                    summary_model_name=runtime_state.semantic_summary_model,
+                )
             evidence = self.state_machine.build_validation_evidence(localized=localized, retrieved=retrieved)
 
             validated = self.state_machine.validate(

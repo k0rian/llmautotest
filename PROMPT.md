@@ -1,8 +1,8 @@
-﻿# 代码审计任务（ICMP - RFC 792 / RFC 1122）
+﻿# 代码审计任务（DNS - RFC 1035）
 
-你是一个面向协议实现一致性验证的代码审计代理。
+你是一个面向协议一致性验证的代码审计代理。
 
-你的目标是：检查 lwIP 中 ICMP 实现是否符合 RFC 792 和 RFC 1122 的关键规范要求。
+你的目标是：检查 DNS 协议实现是否符合 RFC 1035 的核心规范。
 
 ---
 
@@ -10,74 +10,82 @@
 
 仅分析以下内容：
 
-1. ICMP Echo（ping 请求/响应）
-2. ICMP Error Message（错误报文）
-3. ICMP 校验和（checksum）
-4. ICMP 报文合法性校验
+1. DNS 报文解析（Message Parsing）
+2. DNS 报文构造（Message Encoding）
+3. Name Compression（域名压缩）
+4. Header Flags（QR, Opcode, AA, TC, RD, RA, RCODE）
 
 ⚠️ 禁止分析：
-- 网络背景
-- 非 MUST 规范
-- 路由逻辑
+- 上层 resolver 逻辑
+- cache / TTL 策略
+- 网络 IO
 
 ---
 
-## 🔍 审计重点（非常关键🔥）
+## 🔍 审计重点（核心🔥）
 
 ---
 
-### 1️⃣ Echo 请求/响应（核心）
+### 1️⃣ DNS Header 解析（必须）
 
 检查：
 
-- 是否正确处理：
-  - Echo Request（type 8）
-  - Echo Reply（type 0）
+- 是否正确解析：
+  - ID
+  - Flags（QR, Opcode, AA, TC, RD, RA, RCODE）
+  - QDCOUNT / ANCOUNT / NSCOUNT / ARCOUNT
 
 - 是否存在：
-  - 未响应合法请求
-  - 错误构造 reply
-  - payload 未正确复制
+  - flag 位错误解析
+  - RCODE 处理错误
 
 ---
 
-### 2️⃣ Error Message 行为（重点🔥）
+### 2️⃣ Name Compression（关键🔥）
 
-检查是否符合 RFC 1122：
+RFC 1035 要求：
 
-必须验证：
-
-- ❗ 不对以下情况发送 ICMP error：
-  - ICMP error 报文本身
-  - 广播 / 多播报文
-  - 非首分片
-
-- ❗ 是否正确包含：
-  - 原始 IP header
-  - 至少 8 字节 payload
-
----
-
-### 3️⃣ 报文校验（Validation）
+- 支持指针压缩（0xC0）
+- 防止循环引用
+- 正确解析 offset
 
 检查：
 
-- 是否校验：
-  - ICMP header 长度
-  - type / code 合法性
-
-- 是否存在：
-  - malformed packet 未丢弃
+- 是否检测 pointer loop
+- 是否限制递归深度
+- 是否正确处理 pointer + label 混合情况
 
 ---
 
-### 4️⃣ Checksum（完整性）
+### 3️⃣ 报文边界检查（安全性🔥）
+
+检查：
+
+- 是否防止：
+  - 越界读取
+  - malformed packet 解析
+  - 非法 offset
+
+---
+
+### 4️⃣ 报文构造（Encoding）
 
 检查：
 
 - 是否：
-  - 校验 checksum
-  - 构造 reply 时重新计算 checksum
+  - 正确编码 name（label格式）
+  - 正确写入长度字段
+  - 正确处理压缩（如有）
+
+---
+
+### 5️⃣ 错误处理（Error Handling）
+
+检查：
+
+- malformed packet 是否：
+  - 返回错误
+  - 而不是继续解析
 
 ---
 
@@ -87,20 +95,20 @@
 
 ### Step 1：提取 RFC MUST 规则
 
-仅提取：
+仅提取 RFC 1035 中：
 
-- RFC 792
-- RFC 1122（ICMP 部分）
+- Message format
+- Name compression
 
 ---
 
 ### Step 2：语义检索（必须执行）
 
-找到：
+定位：
 
-- icmp_input
-- icmp_echo
-- icmp_dest_unreach（或类似函数）
+- message unpack / parse 函数
+- name decode 函数
+- compression 处理逻辑
 
 输出：
 
@@ -113,12 +121,12 @@
 
 必须分析：
 
-- icmp_input → handler
-- handler → reply / error 生成函数
+- unpack → name parsing
+- name parsing → compression handling
 
 ---
 
-### Step 4：行为对比
+### Step 4：语义对比
 
 RFC vs 实现
 
@@ -130,7 +138,7 @@ Yes / No / Unknown
 
 ---
 
-## 📌 输出格式（严格要求）
+## 📌 输出格式（严格）
 
 ---
 
@@ -158,8 +166,8 @@ Yes / No
 
 ### 4. 严重程度
 
-- High（协议错误）
-- Medium（逻辑缺陷）
+- High（解析错误 / 安全问题）
+- Medium（协议不完全一致）
 - Low（优化问题）
 
 ---
@@ -168,30 +176,16 @@ Yes / No
 
 ---
 
-## 🚫 禁止行为
+## 📂 目标仓库
 
-- 不要只分析单函数
-- 不要忽略 error message 规则
-- 不要在没有证据时下结论
-
----
-
-## 📂 目标代码路径
-
-src/core/ipv4/icmp.c
-
----
-
-## 📄 RFC 文档
-
-- RFC 792（ICMP）
-- RFC 1122（Host Requirements）
+miekg/dns
 
 ---
 
 ## ⚠️ 强制要求
 
-- 每个问题必须包含证据（文件路径+行号）
+- 每个问题必须有证据
 - 至少分析：
-  - Echo path
-  - Error path
+  - Name compression
+  - Message parsing
+- 不允许只分析单函数

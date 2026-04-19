@@ -3,7 +3,7 @@ import traceback
 from pathlib import Path
 from typing import Any
 
-from llm_utils.config_loader import load_api_key
+from llm_utils.config_loader import load_api_key, load_base_url, load_llm_summary_enabled, load_model_name
 from planner.finalizer import finalizer_node
 from planner.perception import perception_node
 from planner.planner import build_plan_and_execute_planner
@@ -39,11 +39,11 @@ def _ensure_runtime_dependencies() -> None:
         ) from RUNTIME_IMPORT_ERROR
 
 
-def build_model(model_name: str = DEFAULT_MODEL_NAME, base_url: str = DEFAULT_BASE_URL) -> Any:
+def build_model(model_name: str = "", base_url: str = "") -> Any:
     _ensure_runtime_dependencies()
     return ChatOpenAI(
-        model=model_name,
-        base_url=base_url,
+        model=model_name or load_model_name(DEFAULT_MODEL_NAME),
+        base_url=base_url or load_base_url() or DEFAULT_BASE_URL,
         api_key=load_api_key(),
         streaming=True,
     )
@@ -151,6 +151,8 @@ def planner_execute_node_factory(planner: Any):
                 "workspace_path": workspace_path,
                 "semantic_required": bool(semantic_fallback or semantic_intent),
                 "semantic_target_hint": semantic_target_hint,
+                "semantic_use_llm_summary": bool(state.get("semantic_use_llm_summary", load_llm_summary_enabled(False))),
+                "semantic_summary_model": read_text(state.get("semantic_summary_model", "")).strip(),
             }
         )
         summary = read_text(result.get("summary", "")).strip()
@@ -187,20 +189,39 @@ async def run_audit_cli_async(
     user_request: str,
     workspace_path: str,
     model: Any | None = None,
+    semantic_use_llm_summary: bool | None = None,
+    semantic_summary_model: str = "",
 ) -> str:
     app = build_cli_graph(model=model)
+    use_llm_summary = load_llm_summary_enabled(False) if semantic_use_llm_summary is None else bool(semantic_use_llm_summary)
     payload = {
         "user_request": user_request.strip() or DEFAULT_AUDIT_REQUEST,
         "workspace_path": str(Path(workspace_path).resolve()),
+        "semantic_use_llm_summary": use_llm_summary,
+        "semantic_summary_model": semantic_summary_model.strip(),
     }
     result: dict[str, Any] = await app.ainvoke(payload)
     return read_text(result.get("final_output", "")).strip()
 
 
-def run_audit_cli(user_request: str, workspace_path: str, model: Any | None = None) -> str:
+def run_audit_cli(
+    user_request: str,
+    workspace_path: str,
+    model: Any | None = None,
+    semantic_use_llm_summary: bool | None = None,
+    semantic_summary_model: str = "",
+) -> str:
     import asyncio
 
-    return asyncio.run(run_audit_cli_async(user_request, workspace_path, model=model))
+    return asyncio.run(
+        run_audit_cli_async(
+            user_request,
+            workspace_path,
+            model=model,
+            semantic_use_llm_summary=semantic_use_llm_summary,
+            semantic_summary_model=semantic_summary_model,
+        )
+    )
 
 
 def runtime_import_traceback() -> str:

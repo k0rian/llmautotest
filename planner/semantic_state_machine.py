@@ -234,9 +234,22 @@ class SemanticStateResult:
 class SemanticStateMachine:
     """Semantic workflow state machine: Localize -> Detect -> Retrieve -> Re-Detect -> Validate."""
 
-    def localize(self, path: str, requirement: str, top_k: int = 5) -> dict[str, Any]:
+    def localize(
+        self,
+        path: str,
+        requirement: str,
+        top_k: int = 5,
+        use_llm_summary: bool = False,
+        summary_model_name: str = "",
+    ) -> dict[str, Any]:
         return _parse_json_text(
-            semantic_localize_requirement.func(path=path, requirement=requirement, top_k=max(1, int(top_k)))
+            semantic_localize_requirement.func(
+                path=path,
+                requirement=requirement,
+                top_k=max(1, int(top_k)),
+                use_llm_summary=bool(use_llm_summary),
+                summary_model_name=summary_model_name,
+            )
         )
 
     def detect(self, requirement: str, localized: dict[str, Any], retrieved: list[dict[str, Any]] | None = None) -> dict[str, Any]:
@@ -244,7 +257,14 @@ class SemanticStateMachine:
         bundle = _build_analysis_bundle(requirement=requirement, localized=localized, retrieved=retrieved)
         return _detect_requirement_coverage(bundle)
 
-    def retrieve(self, path: str, localized: dict[str, Any], top_k: int = 3) -> list[dict[str, Any]]:
+    def retrieve(
+        self,
+        path: str,
+        localized: dict[str, Any],
+        top_k: int = 3,
+        use_llm_summary: bool = False,
+        summary_model_name: str = "",
+    ) -> list[dict[str, Any]]:
         candidates = localized.get("localized_candidates", {}) if isinstance(localized, dict) else {}
         functions = candidates.get("functions", []) if isinstance(candidates, dict) else []
         out: list[dict[str, Any]] = []
@@ -257,12 +277,31 @@ class SemanticStateMachine:
             if not file_path or not fn_name:
                 continue
 
-            definition = _parse_json_text(query_symbol_definition.func(name=fn_name, path=path))
+            definition = _parse_json_text(
+                query_symbol_definition.func(
+                    name=fn_name,
+                    path=path,
+                    use_llm_summary=bool(use_llm_summary),
+                    summary_model_name=summary_model_name,
+                )
+            )
             callees = _parse_json_text(
-                query_callee_functions.func(file_path=file_path, function_name=fn_name, scope_path=path)
+                query_callee_functions.func(
+                    file_path=file_path,
+                    function_name=fn_name,
+                    scope_path=path,
+                    use_llm_summary=bool(use_llm_summary),
+                    summary_model_name=summary_model_name,
+                )
             )
             callers = _parse_json_text(
-                query_caller_functions.func(file_path=file_path, function_name=fn_name, scope_path=path)
+                query_caller_functions.func(
+                    file_path=file_path,
+                    function_name=fn_name,
+                    scope_path=path,
+                    use_llm_summary=bool(use_llm_summary),
+                    summary_model_name=summary_model_name,
+                )
             )
             out.append(
                 {
@@ -286,10 +325,28 @@ class SemanticStateMachine:
     def build_validation_evidence(self, localized: dict[str, Any], retrieved: list[dict[str, Any]]) -> list[dict[str, Any]]:
         return build_validation_evidence(localized=localized, retrieved=retrieved)
 
-    def run_full(self, path: str, requirement: str) -> SemanticStateResult:
-        localized = self.localize(path=path, requirement=requirement, top_k=5)
+    def run_full(
+        self,
+        path: str,
+        requirement: str,
+        use_llm_summary: bool = False,
+        summary_model_name: str = "",
+    ) -> SemanticStateResult:
+        localized = self.localize(
+            path=path,
+            requirement=requirement,
+            top_k=5,
+            use_llm_summary=use_llm_summary,
+            summary_model_name=summary_model_name,
+        )
         detect_1 = self.detect(requirement=requirement, localized=localized, retrieved=[])
-        retrieved = self.retrieve(path=path, localized=localized, top_k=3)
+        retrieved = self.retrieve(
+            path=path,
+            localized=localized,
+            top_k=3,
+            use_llm_summary=use_llm_summary,
+            summary_model_name=summary_model_name,
+        )
         detect_2 = self.detect(requirement=requirement, localized=localized, retrieved=retrieved)
         final_finding = str(detect_2.get("preliminary_finding", detect_1.get("preliminary_finding", "unknown")))
 

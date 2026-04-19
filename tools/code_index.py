@@ -27,7 +27,7 @@ def _node_id(kind: str, path: str, name: str = "", extra: str = "") -> str:
     return f"{kind}:{digest[:16]}"
 
 
-def _cache_file(path: str, include_glob: str) -> Path:
+def _cache_file(path: str, include_glob: str, use_llm: bool = False, model_name: str = "") -> Path:
     scope = resolve_code_scope(
         path=path,
         include_glob=include_glob,
@@ -36,7 +36,8 @@ def _cache_file(path: str, include_glob: str) -> Path:
         skip_dirs=semantic_mod.SKIP_DIRS,
     )
     cache_dir = Path(scope.index_root_path).resolve() / semantic_mod.INDEX_CACHE_DIRNAME / semantic_mod.INDEX_CACHE_SUBDIR
-    digest = _sha1_text(f"{HIER_PREFIX}|{scope.scope_type}|{scope.resolved_path}|{include_glob.lower()}")
+    summary_tag = semantic_mod._summary_cache_tag(use_llm, model_name)
+    digest = _sha1_text(f"{HIER_PREFIX}|{scope.scope_type}|{scope.resolved_path}|{include_glob.lower()}|{summary_tag}")
     return cache_dir / f"{digest}.hier.json"
 
 
@@ -104,8 +105,8 @@ def _build_hierarchical_index_payload(
     use_llm: bool,
     include_glob: str,
     max_files: int,
+    summary_model_name: str = "",
 ) -> dict[str, Any]:
-    del use_llm  # reserved for future P2 upgrade
     scope = resolve_code_scope(
         path=path,
         include_glob=include_glob,
@@ -114,9 +115,10 @@ def _build_hierarchical_index_payload(
         skip_dirs=semantic_mod.SKIP_DIRS,
     )
     root = Path(scope.root_path)
+    summary_model = (summary_model_name or semantic_mod.load_model_name(semantic_mod.DEFAULT_MODEL_NAME)) if use_llm else ""
 
     files = [Path(item) for item in scope.target_files]
-    old_cache_path = _cache_file(path, include_glob)
+    old_cache_path = _cache_file(path, include_glob, use_llm=use_llm, model_name=summary_model)
     previous = _safe_read_json(old_cache_path) if old_cache_path.exists() and not rebuild else {}
     previous_nodes = previous.get("nodes", {}) if isinstance(previous.get("nodes", {}), dict) else {}
     previous_meta = previous.get("artifacts", {}) if isinstance(previous.get("artifacts", {}), dict) else {}
@@ -156,6 +158,11 @@ def _build_hierarchical_index_payload(
 
         rebuilt_file_count += 1
         raw_functions = _extract_functions_for_file(file_path)
+        raw_functions, _summary_errors = semantic_mod._apply_function_summaries(
+            raw_functions=raw_functions,
+            use_llm_summary=bool(use_llm),
+            model_name=summary_model,
+        )
         for item in raw_functions:
             node_hash = _sha1_text(
                 "|".join(
@@ -179,7 +186,7 @@ def _build_hierarchical_index_payload(
                 "kind": "function",
                 "path": str(item.get("file", "")),
                 "name": str(item.get("name", "")),
-                "summary": _deterministic_function_summary(item),
+                "summary": str(item.get("summary", "")) or _deterministic_function_summary(item),
                 "children": [],
                 "language": str(item.get("language", "unknown")),
                 "symbol_count": 1,
@@ -331,6 +338,8 @@ def _build_hierarchical_index_payload(
             "reused_file_count": reused_file_count,
             "rebuilt_file_count": rebuilt_file_count,
             "cache_hit": reused_file_count > 0 and rebuilt_file_count == 0,
+            "summary_mode": "llm" if use_llm else "deterministic",
+            "summary_model": summary_model,
         },
         "artifacts": {
             "cache_path": str(old_cache_path),
@@ -343,8 +352,14 @@ def _build_hierarchical_index_payload(
     return payload
 
 
-def load_hierarchical_code_index(path: str, include_glob: str = semantic_mod.DEFAULT_INCLUDE_GLOB) -> dict[str, Any]:
-    cache = _cache_file(path, include_glob)
+def load_hierarchical_code_index(
+    path: str,
+    include_glob: str = semantic_mod.DEFAULT_INCLUDE_GLOB,
+    use_llm: bool = False,
+    summary_model_name: str = "",
+) -> dict[str, Any]:
+    model_name = (summary_model_name or semantic_mod.load_model_name(semantic_mod.DEFAULT_MODEL_NAME)) if use_llm else ""
+    cache = _cache_file(path, include_glob, use_llm=use_llm, model_name=model_name)
     if not cache.exists():
         return {}
     return _safe_read_json(cache)
@@ -355,6 +370,7 @@ def build_hierarchical_code_index(
     path: str,
     rebuild: bool = False,
     use_llm: bool = False,
+    summary_model_name: str = "",
     include_glob: str = semantic_mod.DEFAULT_INCLUDE_GLOB,
     max_files: int = 2000,
 ) -> str:
@@ -366,6 +382,7 @@ def build_hierarchical_code_index(
             use_llm=bool(use_llm),
             include_glob=include_glob,
             max_files=max(1, int(max_files)),
+            summary_model_name=summary_model_name,
         )
         return json.dumps(
             {

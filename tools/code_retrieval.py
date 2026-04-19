@@ -29,13 +29,19 @@ def _guess_workspace_from_file(file_path: str) -> Path:
     return path.parent
 
 
-def _load_function_records(root: Path | str) -> list[semantic_mod.FunctionRecord]:
+def _load_function_records(
+    root: Path | str,
+    use_llm_summary: bool = False,
+    summary_model_name: str = "",
+) -> list[semantic_mod.FunctionRecord]:
     include_glob = semantic_mod.DEFAULT_INCLUDE_GLOB
     index, _ = semantic_mod._get_or_create_index(
         path=str(root),
         include_glob=include_glob,
         max_files=2000,
         rebuild=False,
+        use_llm_summary=bool(use_llm_summary),
+        model_name=summary_model_name,
     )
     return index.functions
 
@@ -117,14 +123,19 @@ def _parse_evidence_bundle(bundle: Any) -> list[dict[str, Any]]:
 
 
 @tool
-def query_symbol_definition(name: str, path: str) -> str:
+def query_symbol_definition(
+    name: str,
+    path: str,
+    use_llm_summary: bool = False,
+    summary_model_name: str = "",
+) -> str:
     """Find symbol definition candidates by symbol name and return path/line/signature/source summary."""
     try:
         symbol = (name or "").strip()
         if not symbol:
             raise ValueError("name cannot be empty")
         root = Path(path).resolve()
-        records = _load_function_records(root)
+        records = _load_function_records(root, use_llm_summary=use_llm_summary, summary_model_name=summary_model_name)
         matched = [item for item in records if item.name == symbol]
         if not matched:
             matched = [item for item in records if symbol.lower() in item.name.lower()]
@@ -161,11 +172,17 @@ def query_symbol_definition(name: str, path: str) -> str:
 
 
 @tool
-def query_callee_functions(file_path: str, function_name: str, scope_path: str = "") -> str:
+def query_callee_functions(
+    file_path: str,
+    function_name: str,
+    scope_path: str = "",
+    use_llm_summary: bool = False,
+    summary_model_name: str = "",
+) -> str:
     """Find direct callee functions from a given function."""
     try:
         root = Path(scope_path).resolve() if scope_path.strip() else _guess_workspace_from_file(file_path)
-        records = _load_function_records(root)
+        records = _load_function_records(root, use_llm_summary=use_llm_summary, summary_model_name=summary_model_name)
         matched = _match_records(records, file_path=file_path, function_name=function_name)
         if not matched:
             raise ValueError("function not found in semantic index")
@@ -215,14 +232,20 @@ def query_callee_functions(file_path: str, function_name: str, scope_path: str =
 
 
 @tool
-def query_caller_functions(file_path: str, function_name: str, scope_path: str = "") -> str:
+def query_caller_functions(
+    file_path: str,
+    function_name: str,
+    scope_path: str = "",
+    use_llm_summary: bool = False,
+    summary_model_name: str = "",
+) -> str:
     """Find direct caller functions for a given function."""
     try:
         target_name = (function_name or "").strip()
         if not target_name:
             raise ValueError("function_name cannot be empty")
         root = Path(scope_path).resolve() if scope_path.strip() else _guess_workspace_from_file(file_path)
-        records = _load_function_records(root)
+        records = _load_function_records(root, use_llm_summary=use_llm_summary, summary_model_name=summary_model_name)
         callers: list[semantic_mod.FunctionRecord] = []
         for item in records:
             if item.name == target_name:

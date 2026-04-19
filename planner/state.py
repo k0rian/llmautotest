@@ -43,6 +43,8 @@ def create_runtime_state(
     steps: list[PlanStep],
     semantic_required: bool = False,
     semantic_target_hint: str = "",
+    semantic_use_llm_summary: bool = False,
+    semantic_summary_model: str = "",
 ) -> PlannerRuntimeState:
     return PlannerRuntimeState(
         objective=objective,
@@ -58,6 +60,8 @@ def create_runtime_state(
         latest_failure_category="",
         semantic_required=semantic_required,
         semantic_target_hint=semantic_target_hint,
+        semantic_use_llm_summary=semantic_use_llm_summary,
+        semantic_summary_model=semantic_summary_model,
         semantic_context={},
         status="running",
     )

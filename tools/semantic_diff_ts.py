@@ -15,6 +15,7 @@ from tree_sitter import Node, Parser, Query, QueryCursor
 import tree_sitter_language_pack as ts_pack
 
 from llm_utils import iter_code_files, normalize_include_glob as normalize_scope_glob, resolve_code_scope
+from llm_utils.config_loader import DEFAULT_MODEL_NAME, get_client, load_model_name
 
 
 SKIP_DIRS = {
@@ -31,12 +32,12 @@ SKIP_DIRS = {
     "build",
     "temp_cache",
 }
-DEFAULT_INCLUDE_GLOB = "*.py,*.js,*.jsx,*.ts,*.tsx,*.c,*.h,*.cc,*.cpp,*.hpp"
+DEFAULT_INCLUDE_GLOB = "*.py,*.js,*.jsx,*.ts,*.tsx,*.go,*.c,*.h,*.cc,*.cpp,*.hpp"
 MAX_FILE_BYTES = 1024 * 1024
 MAX_SOURCE_CHARS = 2400
 INDEX_CACHE_DIRNAME = ".llmautotest"
 INDEX_CACHE_SUBDIR = "semantic_index"
-SUPPORTED_LANGUAGES = ("python", "javascript", "typescript", "tsx", "c", "cpp")
+SUPPORTED_LANGUAGES = ("python", "javascript", "typescript", "tsx", "go", "c", "cpp")
 STRICT_NATIVE_LANGUAGES = {"c", "cpp"}
 
 CHINESE_KEYWORD_ALIASES = {
@@ -148,6 +149,7 @@ class FunctionRecord:
     token_tf: dict[str, float]
     vector: dict[str, float]
     norm: float
+    summary: str = ""
 
 
 @dataclass
@@ -168,6 +170,9 @@ class SemanticIndex:
     parser_errors: dict[str, str]
     language_symbol_counts: dict[str, dict[str, int]]
     indexed_files_by_language: dict[str, int]
+    summary_mode: str = "deterministic"
+    summary_model: str = ""
+    summary_errors: list[str] | None = None
 
 
 _INDEX_CACHE: dict[str, SemanticIndex] = {}
@@ -177,16 +182,35 @@ _PARSER_ERRORS: dict[str, str] = {}
 _QUERY_CACHE: dict[str, Query] = {}
 
 
-def _cache_key(scope_type: str, resolved_path: str, include_glob: str) -> str:
-    return f"{scope_type}::{Path(resolved_path).resolve()}::{include_glob.strip().lower()}"
+def _summary_cache_tag(use_llm_summary: bool, model_name: str = "") -> str:
+    if not use_llm_summary:
+        return "summary:deterministic"
+    model = (model_name or load_model_name(DEFAULT_MODEL_NAME)).strip()
+    return f"summary:llm:{model}"
+
+
+def _cache_key(scope_type: str, resolved_path: str, include_glob: str, use_llm_summary: bool = False, model_name: str = "") -> str:
+    return (
+        f"{scope_type}::{Path(resolved_path).resolve()}::{include_glob.strip().lower()}"
+        f"::{_summary_cache_tag(use_llm_summary, model_name)}"
+    )
 
 
 def _index_cache_dir(index_root_path: str) -> Path:
     return Path(index_root_path).resolve() / INDEX_CACHE_DIRNAME / INDEX_CACHE_SUBDIR
 
 
-def _index_cache_file(index_root_path: str, scope_type: str, resolved_path: str, include_glob: str) -> Path:
-    digest = hashlib.sha1(_cache_key(scope_type, resolved_path, include_glob).encode("utf-8")).hexdigest()
+def _index_cache_file(
+    index_root_path: str,
+    scope_type: str,
+    resolved_path: str,
+    include_glob: str,
+    use_llm_summary: bool = False,
+    model_name: str = "",
+) -> Path:
+    digest = hashlib.sha1(
+        _cache_key(scope_type, resolved_path, include_glob, use_llm_summary, model_name).encode("utf-8")
+    ).hexdigest()
     return _index_cache_dir(index_root_path) / f"{digest}.json"
 
 
@@ -208,6 +232,9 @@ def _index_to_payload(index: SemanticIndex) -> dict[str, Any]:
         "parser_errors": index.parser_errors,
         "language_symbol_counts": index.language_symbol_counts,
         "indexed_files_by_language": index.indexed_files_by_language,
+        "summary_mode": index.summary_mode,
+        "summary_model": index.summary_model,
+        "summary_errors": index.summary_errors or [],
         "functions": [
             {
                 "file": item.file,
@@ -222,6 +249,7 @@ def _index_to_payload(index: SemanticIndex) -> dict[str, Any]:
                 "token_tf": item.token_tf,
                 "vector": item.vector,
                 "norm": item.norm,
+                "summary": item.summary,
             }
             for item in index.functions
         ],
@@ -247,6 +275,7 @@ def _index_from_payload(payload: dict[str, Any]) -> SemanticIndex:
                 token_tf={str(k): float(v) for k, v in dict(item.get("token_tf", {})).items()},
                 vector={str(k): float(v) for k, v in dict(item.get("vector", {})).items()},
                 norm=float(item.get("norm", 0.0) or 0.0),
+                summary=str(item.get("summary", "")),
             )
         )
 
@@ -297,27 +326,34 @@ def _index_from_payload(payload: dict[str, Any]) -> SemanticIndex:
         parser_errors=parser_errors,
         language_symbol_counts=language_symbol_counts,
         indexed_files_by_language=indexed_files_by_language,
+        summary_mode=str(payload.get("summary_mode", "deterministic")),
+        summary_model=str(payload.get("summary_model", "")),
+        summary_errors=[str(item) for item in payload.get("summary_errors", []) if str(item).strip()],
     )
 
 
-def _save_index_to_disk(scope: Any, include_glob: str, index: SemanticIndex) -> None:
+def _save_index_to_disk(scope: Any, include_glob: str, index: SemanticIndex, use_llm_summary: bool = False, model_name: str = "") -> None:
     cache_file = _index_cache_file(
         index_root_path=scope.index_root_path,
         scope_type=scope.scope_type,
         resolved_path=scope.resolved_path,
         include_glob=include_glob,
+        use_llm_summary=use_llm_summary,
+        model_name=model_name,
     )
     cache_file.parent.mkdir(parents=True, exist_ok=True)
     payload = _index_to_payload(index)
     cache_file.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
 
 
-def _load_index_from_disk(scope: Any, include_glob: str) -> SemanticIndex | None:
+def _load_index_from_disk(scope: Any, include_glob: str, use_llm_summary: bool = False, model_name: str = "") -> SemanticIndex | None:
     cache_file = _index_cache_file(
         index_root_path=scope.index_root_path,
         scope_type=scope.scope_type,
         resolved_path=scope.resolved_path,
         include_glob=include_glob,
+        use_llm_summary=use_llm_summary,
+        model_name=model_name,
     )
     if not cache_file.exists() or not cache_file.is_file():
         return None
@@ -514,6 +550,8 @@ def _detect_language(path: Path) -> str:
         return "typescript"
     if ext == ".tsx":
         return "tsx"
+    if ext == ".go":
+        return "go"
     if ext in {".c", ".h"}:
         return "c"
     if ext in {".cc", ".cpp", ".hpp"}:
@@ -623,6 +661,33 @@ def _extract_functions_js_ts(path: Path, source: bytes, tree: Any, language: str
                 "file": str(path.resolve()),
                 "language": language,
                 "kind": "function_definition",
+                "name": name,
+                "signature": _signature_from_lines(lines, start_line),
+                "start_line": start_line,
+                "end_line": end_line,
+                "doc": "",
+                "source": _node_text(source, node)[:MAX_SOURCE_CHARS],
+            }
+        )
+    return functions
+
+
+def _extract_functions_go(path: Path, source: bytes, tree: Any) -> list[dict[str, Any]]:
+    lines = source.decode("utf-8", errors="ignore").splitlines()
+    functions: list[dict[str, Any]] = []
+    for node in _iter_nodes(tree.root_node):
+        if node.type not in {"function_declaration", "method_declaration"}:
+            continue
+        name = _node_text(source, node.child_by_field_name("name")).strip()
+        if not name:
+            continue
+        start_line = node.start_point[0] + 1
+        end_line = node.end_point[0] + 1
+        functions.append(
+            {
+                "file": str(path.resolve()),
+                "language": "go",
+                "kind": "method_definition" if node.type == "method_declaration" else "function_definition",
                 "name": name,
                 "signature": _signature_from_lines(lines, start_line),
                 "start_line": start_line,
@@ -746,6 +811,8 @@ def _extract_functions(path: Path) -> list[dict[str, Any]]:
         return _extract_functions_python(path, source, tree)
     if language in {"javascript", "typescript", "tsx"}:
         return _extract_functions_js_ts(path, source, tree, language)
+    if language == "go":
+        return _extract_functions_go(path, source, tree)
     if language in STRICT_NATIVE_LANGUAGES:
         return _extract_functions_c_cpp_by_query(path, source, tree, language)
     return []
@@ -772,6 +839,68 @@ def _cosine_similarity(v1: dict[str, float], n1: float, v2: dict[str, float], n2
 
 def _normalize_function_name(name: str) -> str:
     return (name or "").strip().lower()
+
+
+def _deterministic_function_summary(item: dict[str, Any]) -> str:
+    name = str(item.get("name", "")).strip()
+    signature = str(item.get("signature", "")).strip()
+    doc = str(item.get("doc", "")).strip()
+    source = str(item.get("source", "")).strip()
+    if doc:
+        return f"{name}: {doc.splitlines()[0][:160]}".strip()
+    first_line = source.splitlines()[0].strip() if source else ""
+    return f"{name} {signature}".strip() + (f" | {first_line[:120]}" if first_line else "")
+
+
+def _summarize_function_with_llm(item: dict[str, Any], model_name: str) -> str:
+    name = str(item.get("name", "")).strip()
+    language = str(item.get("language", "unknown")).strip()
+    signature = str(item.get("signature", "")).strip()
+    doc = str(item.get("doc", "")).strip()
+    source = str(item.get("source", "")).strip()[:1800]
+    prompt = (
+        "Summarize this code function for semantic retrieval. "
+        "Focus on behavior, inputs, outputs, side effects, and security-relevant intent. "
+        "Return one concise sentence under 80 words.\n\n"
+        f"Language: {language}\n"
+        f"Name: {name}\n"
+        f"Signature: {signature}\n"
+        f"Doc: {doc or 'N/A'}\n"
+        f"Source:\n{source}"
+    )
+    response = get_client().chat.completions.create(
+        model=model_name,
+        messages=[
+            {"role": "system", "content": "You write concise code summaries for semantic code indexing."},
+            {"role": "user", "content": prompt},
+        ],
+        temperature=0,
+        max_tokens=140,
+    )
+    content = response.choices[0].message.content if response.choices else ""
+    summary = str(content or "").strip()
+    return re.sub(r"\s+", " ", summary)[:600]
+
+
+def _apply_function_summaries(
+    raw_functions: list[dict[str, Any]],
+    use_llm_summary: bool,
+    model_name: str,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    errors: list[str] = []
+    active_model = (model_name or load_model_name(DEFAULT_MODEL_NAME)).strip()
+    for item in raw_functions:
+        fallback = _deterministic_function_summary(item)
+        if not use_llm_summary:
+            item["summary"] = fallback
+            continue
+        try:
+            item["summary"] = _summarize_function_with_llm(item, active_model) or fallback
+        except Exception as exc:
+            item["summary"] = fallback
+            name = str(item.get("name", "unknown")).strip() or "unknown"
+            errors.append(f"{name}: {exc}")
+    return raw_functions, errors[:50]
 
 
 def _build_function_name_index(records: list[FunctionRecord]) -> dict[str, list[dict[str, Any]]]:
@@ -819,6 +948,7 @@ def _search_functions(index: SemanticIndex, query: str, top_k: int) -> list[dict
                 "start_line": item.start_line,
                 "end_line": item.end_line,
                 "doc": item.doc[:240],
+                "summary": item.summary[:240],
             }
         )
     return result
@@ -872,7 +1002,13 @@ def _status_by_score(score: float) -> str:
     return "missing"
 
 
-def _build_index(path: str, include_glob: str, max_files: int) -> SemanticIndex:
+def _build_index(
+    path: str,
+    include_glob: str,
+    max_files: int,
+    use_llm_summary: bool = False,
+    model_name: str = "",
+) -> SemanticIndex:
     try:
         root = Path(path).resolve()
         if not root.exists():
@@ -911,6 +1047,12 @@ def _build_index(path: str, include_glob: str, max_files: int) -> SemanticIndex:
         raw_functions: list[dict[str, Any]] = []
         for file_path in file_paths:
             raw_functions.extend(_extract_functions(file_path))
+        active_model_name = (model_name or load_model_name(DEFAULT_MODEL_NAME)).strip()
+        raw_functions, summary_errors = _apply_function_summaries(
+            raw_functions=raw_functions,
+            use_llm_summary=bool(use_llm_summary),
+            model_name=active_model_name,
+        )
 
         documents: list[list[str]] = []
         for item in raw_functions:
@@ -920,6 +1062,7 @@ def _build_index(path: str, include_glob: str, max_files: int) -> SemanticIndex:
                     item.get("name", ""),
                     item.get("signature", ""),
                     item.get("doc", ""),
+                    item.get("summary", ""),
                     Path(item.get("file", "")).name,
                 ]
             )
@@ -955,6 +1098,7 @@ def _build_index(path: str, include_glob: str, max_files: int) -> SemanticIndex:
                     token_tf=tf,
                     vector=vector,
                     norm=_calc_norm(vector),
+                    summary=str(item.get("summary", "")),
                 )
             )
 
@@ -985,12 +1129,22 @@ def _build_index(path: str, include_glob: str, max_files: int) -> SemanticIndex:
                 for language, kinds in language_symbol_counts.items()
             },
             indexed_files_by_language=dict(indexed_files_by_language),
+            summary_mode="llm" if use_llm_summary else "deterministic",
+            summary_model=active_model_name if use_llm_summary else "",
+            summary_errors=summary_errors,
         )
     except Exception as exc:
         raise RuntimeError(f"failed to build semantic index: {exc}") from exc
 
 
-def _get_or_create_index(path: str, include_glob: str, max_files: int, rebuild: bool) -> tuple[SemanticIndex, bool]:
+def _get_or_create_index(
+    path: str,
+    include_glob: str,
+    max_files: int,
+    rebuild: bool,
+    use_llm_summary: bool = False,
+    model_name: str = "",
+) -> tuple[SemanticIndex, bool]:
     scope = resolve_code_scope(
         path=path,
         include_glob=include_glob,
@@ -998,17 +1152,35 @@ def _get_or_create_index(path: str, include_glob: str, max_files: int, rebuild: 
         max_files=max_files,
         skip_dirs=SKIP_DIRS,
     )
-    key = _cache_key(scope.scope_type, scope.resolved_path, scope.include_glob)
+    active_model_name = (model_name or load_model_name(DEFAULT_MODEL_NAME)).strip() if use_llm_summary else ""
+    key = _cache_key(scope.scope_type, scope.resolved_path, scope.include_glob, use_llm_summary, active_model_name)
     if not rebuild and key in _INDEX_CACHE:
         return _INDEX_CACHE[key], True
     if not rebuild:
-        disk_cached = _load_index_from_disk(scope=scope, include_glob=scope.include_glob)
+        disk_cached = _load_index_from_disk(
+            scope=scope,
+            include_glob=scope.include_glob,
+            use_llm_summary=use_llm_summary,
+            model_name=active_model_name,
+        )
         if disk_cached is not None:
             _INDEX_CACHE[key] = disk_cached
             return disk_cached, True
-    index = _build_index(path=path, include_glob=scope.include_glob, max_files=max_files)
+    index = _build_index(
+        path=path,
+        include_glob=scope.include_glob,
+        max_files=max_files,
+        use_llm_summary=use_llm_summary,
+        model_name=active_model_name,
+    )
     _INDEX_CACHE[key] = index
-    _save_index_to_disk(scope=scope, include_glob=scope.include_glob, index=index)
+    _save_index_to_disk(
+        scope=scope,
+        include_glob=scope.include_glob,
+        index=index,
+        use_llm_summary=use_llm_summary,
+        model_name=active_model_name,
+    )
     return index, False
 
 
@@ -1026,9 +1198,12 @@ def semantic_index_functions(
     include_glob: str = DEFAULT_INCLUDE_GLOB,
     max_files: int = 2000,
     rebuild: bool = False,
+    use_llm_summary: bool = False,
+    summary_model_name: str = "",
 ) -> str:
     """
     Build or refresh function-level semantic index for a codebase (Tree-sitter AST).
+    Set use_llm_summary=True to include LLM-generated function summaries in retrieval vectors.
     """
 
     def _handler() -> dict[str, Any]:
@@ -1037,6 +1212,8 @@ def semantic_index_functions(
             include_glob=include_glob,
             max_files=max_files,
             rebuild=rebuild,
+            use_llm_summary=bool(use_llm_summary),
+            model_name=summary_model_name,
         )
         return {
             "status": "ok",
@@ -1049,6 +1226,10 @@ def semantic_index_functions(
             "file_count": index.file_count,
             "function_count": index.function_count,
             "function_name_count": len(index.function_name_index),
+            "summary_mode": index.summary_mode,
+            "summary_model": index.summary_model,
+            "summary_error_count": len(index.summary_errors or []),
+            "summary_errors": index.summary_errors or [],
             "cache_hit": cache_hit,
             "indexed_targets": index.target_files,
             "cache_path": str(
@@ -1057,6 +1238,8 @@ def semantic_index_functions(
                     scope_type=index.scope_type,
                     resolved_path=index.resolved_path,
                     include_glob=index.include_glob,
+                    use_llm_summary=bool(use_llm_summary),
+                    model_name=index.summary_model,
                 )
             ),
             "parser_languages": sorted(_PARSER_FACTORIES.keys()),
@@ -1077,15 +1260,25 @@ def semantic_search_functions(
     include_glob: str = DEFAULT_INCLUDE_GLOB,
     max_files: int = 2000,
     rebuild: bool = False,
+    use_llm_summary: bool = False,
+    summary_model_name: str = "",
 ) -> str:
     """
     Semantic search over indexed functions using natural language query.
+    Set use_llm_summary=True to search an index built with LLM-generated function summaries.
     """
 
     def _handler() -> dict[str, Any]:
         if not query.strip():
             raise ValueError("query cannot be empty")
-        index, _ = _get_or_create_index(path=path, include_glob=include_glob, max_files=max_files, rebuild=rebuild)
+        index, _ = _get_or_create_index(
+            path=path,
+            include_glob=include_glob,
+            max_files=max_files,
+            rebuild=rebuild,
+            use_llm_summary=bool(use_llm_summary),
+            model_name=summary_model_name,
+        )
         hits = _search_functions(index=index, query=query, top_k=max(1, min(int(top_k), 30)))
         return {
             "status": "ok",
@@ -1095,6 +1288,8 @@ def semantic_search_functions(
             "target_path": index.target_path,
             "scope_type": index.scope_type,
             "function_count": index.function_count,
+            "summary_mode": index.summary_mode,
+            "summary_model": index.summary_model,
             "top_k": top_k,
             "indexed_targets": index.target_files,
             "hits": hits,
@@ -1112,6 +1307,8 @@ def semantic_lookup_function_name(
     include_glob: str = DEFAULT_INCLUDE_GLOB,
     max_files: int = 2000,
     rebuild: bool = False,
+    use_llm_summary: bool = False,
+    summary_model_name: str = "",
 ) -> str:
     """
     Lookup indexed functions by function name using the function-name index.
@@ -1120,7 +1317,14 @@ def semantic_lookup_function_name(
     def _handler() -> dict[str, Any]:
         if not name.strip():
             raise ValueError("name cannot be empty")
-        index, _ = _get_or_create_index(path=path, include_glob=include_glob, max_files=max_files, rebuild=rebuild)
+        index, _ = _get_or_create_index(
+            path=path,
+            include_glob=include_glob,
+            max_files=max_files,
+            rebuild=rebuild,
+            use_llm_summary=bool(use_llm_summary),
+            model_name=summary_model_name,
+        )
         matches = _lookup_function_name(index=index, name=name, exact=bool(exact), top_k=top_k)
         return {
             "status": "ok",
@@ -1131,6 +1335,8 @@ def semantic_lookup_function_name(
             "target_path": index.target_path,
             "scope_type": index.scope_type,
             "indexed_targets": index.target_files,
+            "summary_mode": index.summary_mode,
+            "summary_model": index.summary_model,
             "function_name_count": len(index.function_name_index),
             "match_count": len(matches),
             "matches": matches,
@@ -1148,9 +1354,12 @@ def semantic_diff_with_description(
     include_glob: str = DEFAULT_INCLUDE_GLOB,
     max_files: int = 2000,
     rebuild: bool = False,
+    use_llm_summary: bool = False,
+    summary_model_name: str = "",
 ) -> str:
     """
     Compare implementation functions with user description (PRD/API doc/etc.) and output semantic diff.
+    Set use_llm_summary=True to compare against LLM-enriched function summaries.
     """
 
     def _handler() -> dict[str, Any]:
@@ -1158,7 +1367,14 @@ def semantic_diff_with_description(
         if not doc_text:
             raise ValueError("description or description_file is required")
 
-        index, _ = _get_or_create_index(path=path, include_glob=include_glob, max_files=max_files, rebuild=rebuild)
+        index, _ = _get_or_create_index(
+            path=path,
+            include_glob=include_glob,
+            max_files=max_files,
+            rebuild=rebuild,
+            use_llm_summary=bool(use_llm_summary),
+            model_name=summary_model_name,
+        )
         requirements = _split_requirements(doc_text)
         if not requirements:
             raise ValueError("failed to parse requirements from description")
@@ -1218,6 +1434,9 @@ def semantic_diff_with_description(
                 "created_at": index.created_at,
                 "file_count": index.file_count,
                 "function_count": index.function_count,
+                "summary_mode": index.summary_mode,
+                "summary_model": index.summary_model,
+                "summary_error_count": len(index.summary_errors or []),
                 "language_symbol_counts": index.language_symbol_counts,
                 "indexed_files_by_language": index.indexed_files_by_language,
             },

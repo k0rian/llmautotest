@@ -25,15 +25,20 @@ def _score_text(query_tokens: list[str], text: str) -> tuple[float, list[str]]:
     return round(score, 4), sorted(set(overlap))[:8]
 
 
-def _load_or_build(path: str) -> dict[str, Any]:
-    payload = load_hierarchical_code_index(path)
+def _load_or_build(path: str, use_llm: bool = False, summary_model_name: str = "") -> dict[str, Any]:
+    payload = load_hierarchical_code_index(path, use_llm=use_llm, summary_model_name=summary_model_name)
     if payload:
         return payload
-    result = build_hierarchical_code_index.func(path=path, rebuild=False, use_llm=False)
+    result = build_hierarchical_code_index.func(
+        path=path,
+        rebuild=False,
+        use_llm=use_llm,
+        summary_model_name=summary_model_name,
+    )
     parsed = json.loads(result) if result.strip().startswith("{") else {}
     if parsed.get("status") != "ok":
         raise RuntimeError(f"failed to build hierarchical index: {result}")
-    payload = load_hierarchical_code_index(path)
+    payload = load_hierarchical_code_index(path, use_llm=use_llm, summary_model_name=summary_model_name)
     if not payload:
         raise RuntimeError("hierarchical index cache file missing after build")
     return payload
@@ -133,13 +138,23 @@ def _children(nodes: dict[str, dict[str, Any]], node_id: str) -> list[dict[str, 
 
 
 @tool
-def semantic_localize_requirement(path: str, requirement: str, top_k: int = 5) -> str:
+def semantic_localize_requirement(
+    path: str,
+    requirement: str,
+    top_k: int = 5,
+    use_llm_summary: bool = False,
+    summary_model_name: str = "",
+) -> str:
     """Localize requirement across repository -> directory -> file -> function using hierarchical semantic index."""
     try:
         req = (requirement or "").strip()
         if not req:
             raise ValueError("requirement cannot be empty")
-        payload = _load_or_build(path)
+        payload = _load_or_build(
+            path,
+            use_llm=bool(use_llm_summary),
+            summary_model_name=summary_model_name,
+        )
         nodes = _node_map(payload)
         query_tokens = _tokenize(req)
         if not query_tokens:
@@ -194,6 +209,8 @@ def semantic_localize_requirement(path: str, requirement: str, top_k: int = 5) -
                 "resolved_path": payload.get("resolved_path", str(Path(path).resolve())),
                 "scope_type": payload.get("scope_type", "directory"),
                 "indexed_targets": payload.get("indexed_targets", []),
+                "summary_mode": payload.get("stats", {}).get("summary_mode", "deterministic"),
+                "summary_model": payload.get("stats", {}).get("summary_model", ""),
                 "localized_candidates": {
                     "directories": top_dirs,
                     "files": top_files,
