@@ -239,16 +239,12 @@ class SemanticStateMachine:
         path: str,
         requirement: str,
         top_k: int = 5,
-        use_llm_summary: bool = False,
-        summary_model_name: str = "",
     ) -> dict[str, Any]:
         return _parse_json_text(
             semantic_localize_requirement.func(
                 path=path,
                 requirement=requirement,
                 top_k=max(1, int(top_k)),
-                use_llm_summary=bool(use_llm_summary),
-                summary_model_name=summary_model_name,
             )
         )
 
@@ -262,8 +258,6 @@ class SemanticStateMachine:
         path: str,
         localized: dict[str, Any],
         top_k: int = 3,
-        use_llm_summary: bool = False,
-        summary_model_name: str = "",
     ) -> list[dict[str, Any]]:
         candidates = localized.get("localized_candidates", {}) if isinstance(localized, dict) else {}
         functions = candidates.get("functions", []) if isinstance(candidates, dict) else []
@@ -281,8 +275,6 @@ class SemanticStateMachine:
                 query_symbol_definition.func(
                     name=fn_name,
                     path=path,
-                    use_llm_summary=bool(use_llm_summary),
-                    summary_model_name=summary_model_name,
                 )
             )
             callees = _parse_json_text(
@@ -290,8 +282,6 @@ class SemanticStateMachine:
                     file_path=file_path,
                     function_name=fn_name,
                     scope_path=path,
-                    use_llm_summary=bool(use_llm_summary),
-                    summary_model_name=summary_model_name,
                 )
             )
             callers = _parse_json_text(
@@ -299,8 +289,6 @@ class SemanticStateMachine:
                     file_path=file_path,
                     function_name=fn_name,
                     scope_path=path,
-                    use_llm_summary=bool(use_llm_summary),
-                    summary_model_name=summary_model_name,
                 )
             )
             out.append(
@@ -329,23 +317,17 @@ class SemanticStateMachine:
         self,
         path: str,
         requirement: str,
-        use_llm_summary: bool = False,
-        summary_model_name: str = "",
     ) -> SemanticStateResult:
         localized = self.localize(
             path=path,
             requirement=requirement,
             top_k=5,
-            use_llm_summary=use_llm_summary,
-            summary_model_name=summary_model_name,
         )
         detect_1 = self.detect(requirement=requirement, localized=localized, retrieved=[])
         retrieved = self.retrieve(
             path=path,
             localized=localized,
             top_k=3,
-            use_llm_summary=use_llm_summary,
-            summary_model_name=summary_model_name,
         )
         detect_2 = self.detect(requirement=requirement, localized=localized, retrieved=retrieved)
         final_finding = str(detect_2.get("preliminary_finding", detect_1.get("preliminary_finding", "unknown")))

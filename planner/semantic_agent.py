@@ -2,10 +2,10 @@
 from pathlib import Path
 from typing import Any
 
+from build.index_store import load_existing_function_index_any, load_existing_hierarchical_index_any
 from planner.types import PlanStep, PlannerRuntimeState
 from planner.semantic_state_machine import SemanticStateMachine
-from tools.code_index import build_hierarchical_code_index, load_hierarchical_code_index
-from tools.semantic_diff_ts import semantic_index_functions
+from tools.semantic_diff_ts import DEFAULT_INCLUDE_GLOB
 
 
 def _parse_json_text(text: str) -> dict[str, Any]:
@@ -45,62 +45,52 @@ class SemanticAgent:
             requirement = "semantic requirement"
 
         if mode == "semantic_index":
-            use_llm_summary = bool(runtime_state.semantic_use_llm_summary)
-            summary_model = runtime_state.semantic_summary_model
-            result = _parse_json_text(
-                build_hierarchical_code_index.func(
-                    path=target_path,
-                    rebuild=False,
-                    use_llm=use_llm_summary,
-                    summary_model_name=summary_model,
-                )
-            )
-            cache = load_hierarchical_code_index(
+            cache, cache_path, cache_error = load_existing_hierarchical_index_any(
                 target_path,
-                use_llm=use_llm_summary,
-                summary_model_name=summary_model,
+                include_glob=DEFAULT_INCLUDE_GLOB,
+                max_files=2000,
             )
-            fallback = {}
-            index_success = result.get("status") == "ok"
-            if not index_success:
-                fallback = _parse_json_text(
-                    semantic_index_functions.func(
-                        path=target_path,
-                        rebuild=False,
-                        use_llm_summary=use_llm_summary,
-                        summary_model_name=summary_model,
-                    )
-                )
+            function_index, function_cache_path, function_error = load_existing_function_index_any(
+                path=target_path,
+                include_glob=DEFAULT_INCLUDE_GLOB,
+                max_files=2000,
+            )
+            index_success = bool(cache) and function_index is not None
+            missing_error = ""
+            if not cache:
+                missing_error = cache_error
+            elif function_index is None:
+                missing_error = function_error
             context.update(
                 {
                     "path": target_path,
                     "workspace_path": workspace_path,
                     "requirement": requirement,
-                    "index_result": result,
+                    "index_result": cache,
                     "index_stats": cache.get("stats", {}),
-                    "index_fallback": fallback,
-                    "use_llm_summary": use_llm_summary,
-                    "summary_model": summary_model,
+                    "index_error": missing_error,
                 }
             )
             summary = (
                 "semantic_index workflow summary\n"
-                f"- root: {result.get('root', '') or target_path}\n"
-                f"- cache_path: {result.get('cache_path', '')}\n"
-                f"- stats: {json.dumps(result.get('stats', {}), ensure_ascii=False)}\n"
-                f"- use_llm_summary: {use_llm_summary}\n"
-                f"- fallback_used: {bool(fallback)}"
+                f"- root: {cache.get('root', '') or target_path}\n"
+                f"- cache_path: {cache_path}\n"
+                f"- function_cache_path: {function_cache_path}\n"
+                f"- stats: {json.dumps(cache.get('stats', {}), ensure_ascii=False)}\n"
+                f"- summary_mode: {cache.get('stats', {}).get('summary_mode', '') if isinstance(cache.get('stats', {}), dict) else ''}\n"
+                f"- index_available: {index_success}\n"
+                f"- error: {missing_error}"
             )
             return summary, {
                 "stage": "semantic_index",
                 "index_success": index_success,
-                "root": result.get("root", target_path),
-                "cache_path": result.get("cache_path", ""),
-                "stats": result.get("stats", {}),
-                "use_llm_summary": use_llm_summary,
-                "summary_model": summary_model,
+                "root": cache.get("root", target_path),
+                "cache_path": cache_path,
+                "function_cache_path": function_cache_path,
+                "stats": cache.get("stats", {}),
                 "requirement": requirement,
-                "fallback": fallback,
+                "error_stage": "" if index_success else "index_missing",
+                "error": missing_error,
             }
 
         if mode == "semantic_localize":
@@ -108,8 +98,6 @@ class SemanticAgent:
                 path=target_path,
                 requirement=requirement,
                 top_k=5,
-                use_llm_summary=runtime_state.semantic_use_llm_summary,
-                summary_model_name=runtime_state.semantic_summary_model,
             )
             detect = self.state_machine.detect(requirement=requirement, localized=localized, retrieved=[])
             context.update(
@@ -153,8 +141,6 @@ class SemanticAgent:
                     path=target_path,
                     requirement=requirement,
                     top_k=5,
-                    use_llm_summary=runtime_state.semantic_use_llm_summary,
-                    summary_model_name=runtime_state.semantic_summary_model,
                 )
                 context["localized"] = localized
 
@@ -163,16 +149,12 @@ class SemanticAgent:
                 path=target_path,
                 localized=localized,
                 top_k=3,
-                use_llm_summary=runtime_state.semantic_use_llm_summary,
-                summary_model_name=runtime_state.semantic_summary_model,
             )
             if not retrieved:
                 fallback_localized = self.state_machine.localize(
                     path=target_path,
                     requirement=requirement,
                     top_k=12,
-                    use_llm_summary=runtime_state.semantic_use_llm_summary,
-                    summary_model_name=runtime_state.semantic_summary_model,
                 )
                 localized = fallback_localized or localized
                 context["localized"] = localized
@@ -180,8 +162,6 @@ class SemanticAgent:
                     path=target_path,
                     localized=localized,
                     top_k=8,
-                    use_llm_summary=runtime_state.semantic_use_llm_summary,
-                    summary_model_name=runtime_state.semantic_summary_model,
                 )
 
             evidence = self.state_machine.build_validation_evidence(localized=localized, retrieved=retrieved)
@@ -230,16 +210,12 @@ class SemanticAgent:
                     path=target_path,
                     requirement=requirement,
                     top_k=5,
-                    use_llm_summary=runtime_state.semantic_use_llm_summary,
-                    summary_model_name=runtime_state.semantic_summary_model,
                 )
             if not retrieved:
                 retrieved = self.state_machine.retrieve(
                     path=target_path,
                     localized=localized,
                     top_k=3,
-                    use_llm_summary=runtime_state.semantic_use_llm_summary,
-                    summary_model_name=runtime_state.semantic_summary_model,
                 )
             evidence = self.state_machine.build_validation_evidence(localized=localized, retrieved=retrieved)
 

@@ -4,8 +4,8 @@ from typing import Any
 
 from langchain.tools import tool
 
+from build.index_store import load_existing_hierarchical_index_any
 from tools import semantic_diff_ts as semantic_mod
-from tools.code_index import build_hierarchical_code_index, load_hierarchical_code_index
 
 
 def _tokenize(text: str) -> list[str]:
@@ -25,23 +25,11 @@ def _score_text(query_tokens: list[str], text: str) -> tuple[float, list[str]]:
     return round(score, 4), sorted(set(overlap))[:8]
 
 
-def _load_or_build(path: str, use_llm: bool = False, summary_model_name: str = "") -> dict[str, Any]:
-    payload = load_hierarchical_code_index(path, use_llm=use_llm, summary_model_name=summary_model_name)
+def _load_existing(path: str) -> dict[str, Any]:
+    payload, _, error = load_existing_hierarchical_index_any(path)
     if payload:
         return payload
-    result = build_hierarchical_code_index.func(
-        path=path,
-        rebuild=False,
-        use_llm=use_llm,
-        summary_model_name=summary_model_name,
-    )
-    parsed = json.loads(result) if result.strip().startswith("{") else {}
-    if parsed.get("status") != "ok":
-        raise RuntimeError(f"failed to build hierarchical index: {result}")
-    payload = load_hierarchical_code_index(path, use_llm=use_llm, summary_model_name=summary_model_name)
-    if not payload:
-        raise RuntimeError("hierarchical index cache file missing after build")
-    return payload
+    raise RuntimeError(error)
 
 
 def _pick_top(nodes: list[dict[str, Any]], query_tokens: list[str], top_k: int) -> list[dict[str, Any]]:
@@ -150,11 +138,8 @@ def semantic_localize_requirement(
         req = (requirement or "").strip()
         if not req:
             raise ValueError("requirement cannot be empty")
-        payload = _load_or_build(
-            path,
-            use_llm=bool(use_llm_summary),
-            summary_model_name=summary_model_name,
-        )
+        _ = use_llm_summary, summary_model_name
+        payload = _load_existing(path)
         nodes = _node_map(payload)
         query_tokens = _tokenize(req)
         if not query_tokens:

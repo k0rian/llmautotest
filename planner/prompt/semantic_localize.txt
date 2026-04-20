@@ -4,7 +4,7 @@ Goal:
 - Localize requirement scope from repository to directory/file/function levels.
 
 Instructions:
-- Use build_hierarchical_code_index first when index is missing.
+- Use an existing prebuilt hierarchical index. If it is missing, report that the user should run --build-index first.
 - Use semantic_localize_requirement to produce top-k candidates.
 - Explain why each candidate matches.
 - Output structured JSON-ready evidence items.

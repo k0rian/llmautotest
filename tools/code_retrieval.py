@@ -5,6 +5,7 @@ from typing import Any
 
 from langchain.tools import tool
 
+from build.index_store import load_existing_function_index_any
 from tools import semantic_diff_ts as semantic_mod
 
 _CALL_EXCLUDE = {
@@ -34,15 +35,14 @@ def _load_function_records(
     use_llm_summary: bool = False,
     summary_model_name: str = "",
 ) -> list[semantic_mod.FunctionRecord]:
-    include_glob = semantic_mod.DEFAULT_INCLUDE_GLOB
-    index, _ = semantic_mod._get_or_create_index(
+    _ = use_llm_summary, summary_model_name
+    index, _, error = load_existing_function_index_any(
         path=str(root),
-        include_glob=include_glob,
+        include_glob=semantic_mod.DEFAULT_INCLUDE_GLOB,
         max_files=2000,
-        rebuild=False,
-        use_llm_summary=bool(use_llm_summary),
-        model_name=summary_model_name,
     )
+    if index is None:
+        raise RuntimeError(error)
     return index.functions
 
 

@@ -3,6 +3,7 @@ You need to replan remaining steps based on completed steps and failure details.
 - Return only remaining steps.
 - mode must be one of: code_audit, gui_test, analysis, semantic_diff, semantic_index, semantic_localize, semantic_retrieve, semantic_validate.
 - Preserve or set target_path for semantic_* steps when a scoped directory is required.
+- semantic_index means checking/loading an existing prebuilt index only; do not plan index construction during audit.
 - Number of steps: 1 to 4.
 
 Return JSON only, no markdown.

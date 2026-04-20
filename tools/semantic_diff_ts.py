@@ -35,6 +35,7 @@ SKIP_DIRS = {
 DEFAULT_INCLUDE_GLOB = "*.py,*.js,*.jsx,*.ts,*.tsx,*.go,*.c,*.h,*.cc,*.cpp,*.hpp"
 MAX_FILE_BYTES = 1024 * 1024
 MAX_SOURCE_CHARS = 2400
+LLM_SUMMARY_BATCH_SIZE = 20
 INDEX_CACHE_DIRNAME = ".llmautotest"
 INDEX_CACHE_SUBDIR = "semantic_index"
 SUPPORTED_LANGUAGES = ("python", "javascript", "typescript", "tsx", "go", "c", "cpp")
@@ -852,34 +853,95 @@ def _deterministic_function_summary(item: dict[str, Any]) -> str:
     return f"{name} {signature}".strip() + (f" | {first_line[:120]}" if first_line else "")
 
 
-def _summarize_function_with_llm(item: dict[str, Any], model_name: str) -> str:
-    name = str(item.get("name", "")).strip()
-    language = str(item.get("language", "unknown")).strip()
-    signature = str(item.get("signature", "")).strip()
-    doc = str(item.get("doc", "")).strip()
-    source = str(item.get("source", "")).strip()[:1800]
-    prompt = (
-        "Summarize this code function for semantic retrieval. "
+def _llm_summary_response_schema() -> dict[str, Any]:
+    return {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "function_summaries",
+            "strict": True,
+            "schema": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "name": {"type": "string"},
+                        "summary": {"type": "string"},
+                    },
+                    "required": ["name", "summary"],
+                },
+            },
+        },
+    }
+
+
+def _build_llm_summary_batch_prompt(items: list[dict[str, Any]]) -> str:
+    payload: list[dict[str, str]] = []
+    for index, item in enumerate(items, start=1):
+        payload.append(
+            {
+                "index": str(index),
+                "name": str(item.get("name", "")).strip(),
+                "language": str(item.get("language", "unknown")).strip(),
+                "signature": str(item.get("signature", "")).strip(),
+                "doc": str(item.get("doc", "")).strip()[:500] or "N/A",
+                "source": str(item.get("source", "")).strip()[:1800],
+            }
+        )
+    return (
+        "Summarize each code function for semantic retrieval. "
         "Focus on behavior, inputs, outputs, side effects, and security-relevant intent. "
-        "Return one concise sentence under 80 words.\n\n"
-        f"Language: {language}\n"
-        f"Name: {name}\n"
-        f"Signature: {signature}\n"
-        f"Doc: {doc or 'N/A'}\n"
-        f"Source:\n{source}"
+        "Return exactly one concise summary per input function as a JSON array. "
+        "Each summary must be under 80 words.\n\n"
+        f"Functions JSON:\n{json.dumps(payload, ensure_ascii=False)}"
     )
+
+
+def _parse_llm_summary_response(content: str) -> dict[str, str]:
+    try:
+        payload = json.loads(content or "")
+    except Exception:
+        return {}
+    summaries = payload.get("summaries", []) if isinstance(payload, dict) else payload
+    if not isinstance(summaries, list):
+        return {}
+    result: dict[str, str] = {}
+    for item in summaries:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name", "")).strip()
+        summary = re.sub(r"\s+", " ", str(item.get("summary", "")).strip())[:600]
+        if name and summary:
+            result[name] = summary
+    return result
+
+
+def _summarize_functions_with_llm_batch(items: list[dict[str, Any]], model_name: str) -> dict[str, str]:
+    if not items:
+        return {}
     response = get_client().chat.completions.create(
         model=model_name,
         messages=[
             {"role": "system", "content": "You write concise code summaries for semantic code indexing."},
-            {"role": "user", "content": prompt},
+            {"role": "user", "content": _build_llm_summary_batch_prompt(items)},
         ],
+        response_format=_llm_summary_response_schema(),
         temperature=0,
-        max_tokens=140,
+        max_tokens=max(300, min(3000, 140 * len(items))),
     )
     content = response.choices[0].message.content if response.choices else ""
-    summary = str(content or "").strip()
-    return re.sub(r"\s+", " ", summary)[:600]
+    return _parse_llm_summary_response(str(content or ""))
+
+
+def _apply_batch_summaries(items: list[dict[str, Any]], summaries_by_name: dict[str, str]) -> None:
+    used_counts: dict[str, int] = defaultdict(int)
+    for item in items:
+        name = str(item.get("name", "")).strip()
+        candidates = [key for key in (name, f"{name}#{used_counts[name] + 1}") if summaries_by_name.get(key)]
+        summary = next((summaries_by_name[key] for key in candidates if summaries_by_name.get(key)), "")
+        if summary:
+            item["summary"] = summary
+            used_counts[name] += 1
 
 
 def _apply_function_summaries(
@@ -890,16 +952,24 @@ def _apply_function_summaries(
     errors: list[str] = []
     active_model = (model_name or load_model_name(DEFAULT_MODEL_NAME)).strip()
     for item in raw_functions:
-        fallback = _deterministic_function_summary(item)
-        if not use_llm_summary:
-            item["summary"] = fallback
-            continue
+        item["summary"] = _deterministic_function_summary(item)
+    if not use_llm_summary:
+        return raw_functions, errors
+
+    for start in range(0, len(raw_functions), LLM_SUMMARY_BATCH_SIZE):
+        batch = raw_functions[start : start + LLM_SUMMARY_BATCH_SIZE]
         try:
-            item["summary"] = _summarize_function_with_llm(item, active_model) or fallback
+            summaries = _summarize_functions_with_llm_batch(batch, active_model)
+            _apply_batch_summaries(batch, summaries)
+            missing = [
+                str(item.get("name", "unknown")).strip() or "unknown"
+                for item in batch
+                if not summaries.get(str(item.get("name", "")).strip())
+            ]
+            if missing:
+                errors.append(f"batch {start // LLM_SUMMARY_BATCH_SIZE + 1}: missing summaries for {', '.join(missing[:5])}")
         except Exception as exc:
-            item["summary"] = fallback
-            name = str(item.get("name", "unknown")).strip() or "unknown"
-            errors.append(f"{name}: {exc}")
+            errors.append(f"batch {start // LLM_SUMMARY_BATCH_SIZE + 1}: {exc}")
     return raw_functions, errors[:50]
 
 
@@ -1192,6 +1262,19 @@ def _execute_tool(handler: Callable[[], dict[str, Any]], error_prefix: str) -> s
         return f"{error_prefix} error: {exc}"
 
 
+def _load_existing_index_for_audit(path: str, include_glob: str, max_files: int) -> tuple[SemanticIndex, str]:
+    from build.index_store import load_existing_function_index_any
+
+    index, cache_path, error = load_existing_function_index_any(
+        path=path,
+        include_glob=include_glob,
+        max_files=max_files,
+    )
+    if index is None:
+        raise RuntimeError(error)
+    return index, cache_path
+
+
 @tool
 def semantic_index_functions(
     path: str,
@@ -1271,13 +1354,11 @@ def semantic_search_functions(
     def _handler() -> dict[str, Any]:
         if not query.strip():
             raise ValueError("query cannot be empty")
-        index, _ = _get_or_create_index(
+        _ = rebuild, use_llm_summary, summary_model_name
+        index, cache_path = _load_existing_index_for_audit(
             path=path,
             include_glob=include_glob,
             max_files=max_files,
-            rebuild=rebuild,
-            use_llm_summary=bool(use_llm_summary),
-            model_name=summary_model_name,
         )
         hits = _search_functions(index=index, query=query, top_k=max(1, min(int(top_k), 30)))
         return {
@@ -1292,6 +1373,7 @@ def semantic_search_functions(
             "summary_model": index.summary_model,
             "top_k": top_k,
             "indexed_targets": index.target_files,
+            "cache_path": cache_path,
             "hits": hits,
         }
 
@@ -1317,13 +1399,11 @@ def semantic_lookup_function_name(
     def _handler() -> dict[str, Any]:
         if not name.strip():
             raise ValueError("name cannot be empty")
-        index, _ = _get_or_create_index(
+        _ = rebuild, use_llm_summary, summary_model_name
+        index, cache_path = _load_existing_index_for_audit(
             path=path,
             include_glob=include_glob,
             max_files=max_files,
-            rebuild=rebuild,
-            use_llm_summary=bool(use_llm_summary),
-            model_name=summary_model_name,
         )
         matches = _lookup_function_name(index=index, name=name, exact=bool(exact), top_k=top_k)
         return {
@@ -1339,6 +1419,7 @@ def semantic_lookup_function_name(
             "summary_model": index.summary_model,
             "function_name_count": len(index.function_name_index),
             "match_count": len(matches),
+            "cache_path": cache_path,
             "matches": matches,
         }
 
@@ -1367,13 +1448,11 @@ def semantic_diff_with_description(
         if not doc_text:
             raise ValueError("description or description_file is required")
 
-        index, _ = _get_or_create_index(
+        _ = rebuild, use_llm_summary, summary_model_name
+        index, cache_path = _load_existing_index_for_audit(
             path=path,
             include_glob=include_glob,
             max_files=max_files,
-            rebuild=rebuild,
-            use_llm_summary=bool(use_llm_summary),
-            model_name=summary_model_name,
         )
         requirements = _split_requirements(doc_text)
         if not requirements:
@@ -1439,6 +1518,7 @@ def semantic_diff_with_description(
                 "summary_error_count": len(index.summary_errors or []),
                 "language_symbol_counts": index.language_symbol_counts,
                 "indexed_files_by_language": index.indexed_files_by_language,
+                "cache_path": cache_path,
             },
             "summary": {
                 "requirements": len(requirement_matches),

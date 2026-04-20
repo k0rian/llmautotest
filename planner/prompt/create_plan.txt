@@ -9,6 +9,7 @@ Generate an executable plan for the user objective.
 - Use gui_test only for real UI interaction/verification.
 - Use analysis for synthesis/judgment/conclusion steps.
 - Use semantic_index/semantic_localize/semantic_retrieve/semantic_validate as the default semantic pipeline for requirement-alignment tasks.
+- semantic_index in audit mode means checking/loading an existing prebuilt index only; do not plan index construction during audit.
 - Use semantic_diff only for compatibility fallback or when explicitly requested.
 
 Return JSON only, no markdown.

@@ -35,21 +35,65 @@ from planner.verifier import (
 from planner.semantic_agent import SemanticAgent
 from tools.description.description import TOOL_DESCRIPTIONS
 from tools.core import WorkspaceGuard
-from tools.semantic_diff_ts import semantic_diff_with_description, semantic_index_functions
+from build.index_store import load_existing_function_index_any
+from tools.semantic_diff_ts import DEFAULT_INCLUDE_GLOB, semantic_diff_with_description
 from tools.tools import build_tools
 
 PROMPT_DIR = Path(__file__).resolve().parent / "prompt"
 SEMANTIC_MODE_ALIASES = {
+    "audit": "code_audit",
+    "code_scan": "code_audit",
+    "static_audit": "code_audit",
+    "static_scan": "code_audit",
+    "summary": "analysis",
+    "summarize": "analysis",
+    "report": "analysis",
     "semantic_analysis": "semantic_diff",
     "semantic-index": "semantic_index",
+    "semantic index": "semantic_index",
+    "index": "semantic_index",
+    "index_check": "semantic_index",
+    "semantic_index_check": "semantic_index",
     "semantic_localization": "semantic_localize",
     "semantic-localize": "semantic_localize",
+    "semantic localize": "semantic_localize",
+    "semantic_locate": "semantic_localize",
+    "semantic-location": "semantic_localize",
+    "function_localization": "semantic_localize",
+    "function_localize": "semantic_localize",
+    "function_location": "semantic_localize",
+    "function_locate": "semantic_localize",
+    "locate_function": "semantic_localize",
+    "symbol_localize": "semantic_localize",
+    "symbol_location": "semantic_localize",
+    "implementation_localize": "semantic_localize",
+    "core_implementation_localize": "semantic_localize",
+    "核心实现函数定位": "semantic_localize",
+    "函数定位": "semantic_localize",
     "semantic-retrieve": "semantic_retrieve",
     "semantic-retrieval": "semantic_retrieve",
+    "semantic retrieve": "semantic_retrieve",
+    "function_retrieve": "semantic_retrieve",
+    "symbol_retrieve": "semantic_retrieve",
     "semantic-validation": "semantic_validate",
     "semantic-validate": "semantic_validate",
+    "semantic validate": "semantic_validate",
+    "semantic_validation": "semantic_validate",
+    "compliance_validate": "semantic_validate",
     "semanticdiff": "semantic_diff",
     "semantic diff": "semantic_diff",
+    "semantic-diff": "semantic_diff",
+}
+BUILD_ONLY_TOOL_NAMES = {"semantic_index_functions", "build_hierarchical_code_index"}
+VALID_STEP_MODES = {
+    "code_audit",
+    "gui_test",
+    "analysis",
+    "semantic_diff",
+    "semantic_index",
+    "semantic_localize",
+    "semantic_retrieve",
+    "semantic_validate",
 }
 
 
@@ -84,6 +128,8 @@ def _parse_json_payload(text: str) -> dict[str, Any]:
 def _tool_description_text() -> str:
     blocks: list[str] = []
     for name, meta in TOOL_DESCRIPTIONS.items():
+        if name in BUILD_ONLY_TOOL_NAMES:
+            continue
         category = meta.get("category", "general")
         description = meta.get("description", "")
         blocks.append(f"{name} [{category}]\n{description}")
@@ -125,6 +171,42 @@ def _invoke_tool_callable(tool_obj: Any, **kwargs: Any) -> str:
     raise TypeError(f"unsupported tool object: {type(tool_obj).__name__}")
 
 
+def _canonical_mode_token(value: str) -> str:
+    token = (value or "").strip().lower()
+    token = re.sub(r"[\s\-]+", "_", token)
+    return re.sub(r"_+", "_", token).strip("_")
+
+
+def _infer_step_mode(raw_mode: str, title: str, objective: str) -> str:
+    raw = read_text(raw_mode).strip()
+    canonical = _canonical_mode_token(raw)
+    if canonical in VALID_STEP_MODES:
+        return canonical
+    if raw.lower() in SEMANTIC_MODE_ALIASES:
+        return SEMANTIC_MODE_ALIASES[raw.lower()]
+    if canonical in SEMANTIC_MODE_ALIASES:
+        return SEMANTIC_MODE_ALIASES[canonical]
+
+    text = f"{raw} {title} {objective}".lower()
+    if any(token in text for token in ("gui", "ui", "界面", "浏览器", "点击")):
+        return "gui_test"
+    if any(token in text for token in ("diff", "compare", "对比", "差异")):
+        return "semantic_diff"
+    if any(token in text for token in ("index", "索引")):
+        return "semantic_index"
+    if any(token in text for token in ("retrieve", "retrieval", "caller", "callee", "call graph", "调用", "上下文", "检索")):
+        return "semantic_retrieve"
+    if any(token in text for token in ("validate", "validation", "verify", "coverage", "合规", "验证", "覆盖率")):
+        return "semantic_validate"
+    if any(token in text for token in ("localize", "locate", "location", "symbol", "function", "implementation", "函数", "符号", "定位", "实现", "核心")):
+        return "semantic_localize"
+    if any(token in text for token in ("audit", "scan", "grep", "read", "lsp", "semgrep", "审计", "扫描", "读取", "搜索", "静态")):
+        return "code_audit"
+    if any(token in text for token in ("analysis", "summarize", "summary", "report", "判断", "分析", "汇总", "总结", "报告")):
+        return "analysis"
+    return "analysis"
+
+
 class PlanAndExecutePlanner:
     def __init__(
         self,
@@ -158,8 +240,6 @@ class PlanAndExecutePlanner:
         workspace_path = read_text(inputs.get("workspace_path", "")).strip()
         semantic_required = bool(inputs.get("semantic_required", False))
         semantic_target_hint = read_text(inputs.get("semantic_target_hint", "")).strip()
-        semantic_use_llm_summary = bool(inputs.get("semantic_use_llm_summary", False))
-        semantic_summary_model = read_text(inputs.get("semantic_summary_model", "")).strip()
         result = self.execute(
             objective=objective,
             context=context,
@@ -167,8 +247,6 @@ class PlanAndExecutePlanner:
             workspace_path=workspace_path,
             semantic_required=semantic_required,
             semantic_target_hint=semantic_target_hint,
-            semantic_use_llm_summary=semantic_use_llm_summary,
-            semantic_summary_model=semantic_summary_model,
         )
         return result.to_dict()
 
@@ -208,8 +286,6 @@ class PlanAndExecutePlanner:
         workspace_path: str = "",
         semantic_required: bool = False,
         semantic_target_hint: str = "",
-        semantic_use_llm_summary: bool = False,
-        semantic_summary_model: str = "",
     ) -> PlannerRunResult:
         if not objective or not objective.strip():
             empty_state = create_runtime_state(objective="", context=context, summary="", steps=[])
@@ -240,8 +316,6 @@ class PlanAndExecutePlanner:
             steps=steps,
             semantic_required=semantic_required,
             semantic_target_hint=semantic_target_hint,
-            semantic_use_llm_summary=semantic_use_llm_summary,
-            semantic_summary_model=semantic_summary_model,
         )
 
         while True:
@@ -369,8 +443,6 @@ class PlanAndExecutePlanner:
                 step=step,
                 history=history,
                 workspace_path=workspace_path,
-                use_llm_summary=runtime_state.semantic_use_llm_summary,
-                summary_model_name=runtime_state.semantic_summary_model,
             )
             lowered = text.lower()
             error_stage = read_text(structured_output.get("error_stage", "")).strip().lower()
@@ -509,25 +581,13 @@ class PlanAndExecutePlanner:
         steps: list[PlanStep] = []
         if not isinstance(steps_data, list):
             return steps
-        valid_modes = {
-            "code_audit",
-            "gui_test",
-            "analysis",
-            "semantic_diff",
-            "semantic_index",
-            "semantic_localize",
-            "semantic_retrieve",
-            "semantic_validate",
-        }
         for idx, item in enumerate(steps_data, start=1):
             if not isinstance(item, dict):
                 continue
             raw_mode = read_text(item.get("mode", "code_audit")).strip() or "code_audit"
-            normalized_mode = SEMANTIC_MODE_ALIASES.get(raw_mode.lower(), raw_mode)
-            if normalized_mode not in valid_modes:
-                normalized_mode = "invalid"
             title = read_text(item.get("title", f"Step {idx}")).strip() or f"Step {idx}"
             objective = read_text(item.get("objective", "")).strip() or title
+            normalized_mode = _infer_step_mode(raw_mode=raw_mode, title=title, objective=objective)
             expected_output = read_text(item.get("expected_output", "")).strip() or "Return the step execution result"
             target_path = read_text(item.get("target_path", "")).strip()
             steps.append(
@@ -587,13 +647,13 @@ class PlanAndExecutePlanner:
 
     def _build_forced_semantic_pipeline_step(self, mode: str, target_hint: str = "") -> PlanStep:
         title_map = {
-            "semantic_index": "Build hierarchical semantic index",
+            "semantic_index": "Check existing semantic index",
             "semantic_localize": "Localize requirement with hierarchical index",
             "semantic_retrieve": "Retrieve symbol/graph context for unknown findings",
             "semantic_validate": "Validate semantic findings and classify confidence",
         }
         objective_map = {
-            "semantic_index": "Build repository -> directory -> file -> function semantic index with cache support.",
+            "semantic_index": "Check that a prebuilt repository -> directory -> file -> function semantic index is available.",
             "semantic_localize": "Localize requirement to top directories/files/functions with score and reasons.",
             "semantic_retrieve": "When evidence is insufficient, retrieve definition/caller/callee context and re-detect.",
             "semantic_validate": "Validate preliminary semantic findings and output structured decision and confidence.",
@@ -694,8 +754,6 @@ class PlanAndExecutePlanner:
         step: PlanStep,
         history: list[PlanStep],
         workspace_path: str,
-        use_llm_summary: bool = False,
-        summary_model_name: str = "",
     ) -> tuple[str, dict[str, Any]]:
         resolved_workspace = workspace_path.strip() or self._extract_workspace_path_from_context(context)
         if not resolved_workspace:
@@ -745,21 +803,34 @@ class PlanAndExecutePlanner:
             history=history,
         )
         try:
-            index_result = _invoke_tool_callable(
-                semantic_index_functions,
+            existing_index, index_cache_path, index_error = load_existing_function_index_any(
                 path=target_path,
-                rebuild=False,
-                use_llm_summary=bool(use_llm_summary),
-                summary_model_name=summary_model_name,
+                include_glob=DEFAULT_INCLUDE_GLOB,
+                max_files=2000,
             )
-            index_text = read_text(index_result).strip()
+            if existing_index is None:
+                raise RuntimeError(index_error)
+            index_text = json.dumps(
+                {
+                    "status": "ok",
+                    "root": existing_index.root,
+                    "resolved_path": existing_index.resolved_path,
+                    "target_path": existing_index.target_path,
+                    "scope_type": existing_index.scope_type,
+                    "file_count": existing_index.file_count,
+                    "function_count": existing_index.function_count,
+                    "summary_mode": existing_index.summary_mode,
+                    "summary_model": existing_index.summary_model,
+                    "indexed_targets": existing_index.target_files,
+                    "cache_path": index_cache_path,
+                },
+                ensure_ascii=False,
+            )
             diff_result = _invoke_tool_callable(
                 semantic_diff_with_description,
                 path=target_path,
                 description=description,
                 rebuild=False,
-                use_llm_summary=bool(use_llm_summary),
-                summary_model_name=summary_model_name,
             )
             diff_text = read_text(diff_result).strip()
             index_data = self._safe_parse_json(index_text)

@@ -52,6 +52,12 @@ from tools.lsp import (
 )
 from tools.static_analysis import audit_codebase, list_audit_rules, semgrep_scan
 
+BUILD_ONLY_TOOL_NAMES = {
+    "semantic_index_functions",
+    "build_hierarchical_code_index",
+}
+
+
 def _tool_registry() -> dict[str, Any]:
     return {
         "read_file": ReadFileTool(),
@@ -102,7 +108,7 @@ def _tool_registry() -> dict[str, Any]:
 
 def build_tools() -> list[Any]:
     registry = _tool_registry()
-    return [registry[name] for name in TOOL_DESCRIPTIONS if name in registry]
+    return [registry[name] for name in TOOL_DESCRIPTIONS if name in registry and name not in BUILD_ONLY_TOOL_NAMES]
 
 
 def build_tool_description_map() -> dict[str, dict[str, str]]:
