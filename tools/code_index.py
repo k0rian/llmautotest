@@ -60,6 +60,38 @@ def _deterministic_function_summary(item: dict[str, Any]) -> str:
     return f"{name} {signature}".strip() + (f" | {first_line[:120]}" if first_line else "")
 
 
+def _summary_vector_fields(file_path: str, name: str, summary: str) -> dict[str, Any]:
+    tokens = semantic_mod._tokenize(
+        semantic_mod._summary_vector_text(
+            file_path=file_path,
+            name=name,
+            summary=summary,
+        )
+    )
+    tf = semantic_mod._calc_tf(tokens)
+    return {
+        "summary_vector": tf,
+        "summary_norm": semantic_mod._calc_norm(tf),
+    }
+
+
+def _ensure_node_summary_vector(node: dict[str, Any]) -> dict[str, Any]:
+    if node.get("kind") != "function":
+        return node
+    vector = node.get("summary_vector")
+    norm = float(node.get("summary_norm", 0.0) or 0.0)
+    if isinstance(vector, dict) and vector and norm > 0:
+        return node
+    node.update(
+        _summary_vector_fields(
+            file_path=str(node.get("path", "")),
+            name=str(node.get("name", "")),
+            summary=str(node.get("summary", "")),
+        )
+    )
+    return node
+
+
 def _aggregate_summary(items: list[str], fallback: str) -> str:
     cleaned = [value.strip() for value in items if value and value.strip()]
     if not cleaned:
@@ -153,7 +185,7 @@ def _build_hierarchical_index_payload(
                     continue
                 if str(node.get("path", "")) != file_abs:
                     continue
-                file_to_functions[file_abs].append(node)
+                file_to_functions[file_abs].append(_ensure_node_summary_vector(dict(node)))
             continue
 
         rebuilt_file_count += 1
@@ -176,6 +208,7 @@ def _build_hierarchical_index_payload(
                     ]
                 )
             )
+            summary = str(item.get("summary", "")) or _deterministic_function_summary(item)
             node = {
                 "id": _node_id(
                     "function",
@@ -186,7 +219,7 @@ def _build_hierarchical_index_payload(
                 "kind": "function",
                 "path": str(item.get("file", "")),
                 "name": str(item.get("name", "")),
-                "summary": str(item.get("summary", "")) or _deterministic_function_summary(item),
+                "summary": summary,
                 "children": [],
                 "language": str(item.get("language", "unknown")),
                 "symbol_count": 1,
@@ -196,6 +229,13 @@ def _build_hierarchical_index_payload(
                 "signature": str(item.get("signature", "")),
                 "source_summary": str(item.get("source", ""))[:280],
             }
+            node.update(
+                _summary_vector_fields(
+                    file_path=str(item.get("file", "")),
+                    name=str(item.get("name", "")),
+                    summary=summary,
+                )
+            )
             file_to_functions[file_abs].append(node)
 
     # Write function nodes into node table first.

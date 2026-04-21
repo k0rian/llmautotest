@@ -38,6 +38,8 @@ def _read_json(path: Path) -> dict[str, Any]:
 def _include_matches(payload: dict[str, Any], include_glob: str) -> bool:
     actual = str(payload.get("include_glob", "")).strip().lower()
     expected = (include_glob or semantic_mod.DEFAULT_INCLUDE_GLOB).strip().lower()
+    if expected == semantic_mod.DEFAULT_INCLUDE_GLOB.lower():
+        return bool(actual)
     return not actual or actual == expected
 
 

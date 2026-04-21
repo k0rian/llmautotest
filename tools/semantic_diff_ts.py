@@ -148,9 +148,13 @@ class FunctionRecord:
     doc: str
     source: str
     token_tf: dict[str, float]
+    # vector/norm stay implementation-aware: summary/signature/doc plus source tokens.
     vector: dict[str, float]
     norm: float
     summary: str = ""
+    # summary_vector/summary_norm are summary-aware and used for coarse localization.
+    summary_vector: dict[str, float] | None = None
+    summary_norm: float = 0.0
 
 
 @dataclass
@@ -251,34 +255,75 @@ def _index_to_payload(index: SemanticIndex) -> dict[str, Any]:
                 "vector": item.vector,
                 "norm": item.norm,
                 "summary": item.summary,
+                "summary_vector": item.summary_vector or {},
+                "summary_norm": item.summary_norm,
             }
             for item in index.functions
         ],
     }
 
 
+def _summary_vector_text(file_path: str, name: str, summary: str) -> str:
+    return " ".join(
+        [
+            str(name or "").strip(),
+            str(summary or "").strip(),
+            Path(str(file_path or "")).name,
+        ]
+    ).strip()
+
+
+def _summary_vector_for_function(
+    *,
+    file_path: str,
+    name: str,
+    summary: str,
+    idf: dict[str, float],
+) -> tuple[dict[str, float], float]:
+    tokens = _tokenize(_summary_vector_text(file_path=file_path, name=name, summary=summary))
+    vector = _calc_vector(_calc_tf(tokens), idf)
+    return vector, _calc_norm(vector)
+
+
+def _ensure_summary_vector(record: FunctionRecord, idf: dict[str, float]) -> FunctionRecord:
+    if record.summary_vector and record.summary_norm > 0:
+        return record
+    vector, norm = _summary_vector_for_function(
+        file_path=record.file,
+        name=record.name,
+        summary=record.summary,
+        idf=idf,
+    )
+    record.summary_vector = vector
+    record.summary_norm = norm
+    return record
+
+
 def _index_from_payload(payload: dict[str, Any]) -> SemanticIndex:
     functions: list[FunctionRecord] = []
+    raw_idf = payload.get("idf", {})
+    idf = {str(k): float(v) for k, v in raw_idf.items()} if isinstance(raw_idf, dict) else {}
     for item in payload.get("functions", []):
         if not isinstance(item, dict):
             continue
-        functions.append(
-            FunctionRecord(
-                file=str(item.get("file", "")),
-                language=str(item.get("language", "unknown")),
-                kind=str(item.get("kind", "function_definition")),
-                name=str(item.get("name", "")),
-                signature=str(item.get("signature", "")),
-                start_line=int(item.get("start_line", 0) or 0),
-                end_line=int(item.get("end_line", 0) or 0),
-                doc=str(item.get("doc", "")),
-                source=str(item.get("source", "")),
-                token_tf={str(k): float(v) for k, v in dict(item.get("token_tf", {})).items()},
-                vector={str(k): float(v) for k, v in dict(item.get("vector", {})).items()},
-                norm=float(item.get("norm", 0.0) or 0.0),
-                summary=str(item.get("summary", "")),
-            )
+        record = FunctionRecord(
+            file=str(item.get("file", "")),
+            language=str(item.get("language", "unknown")),
+            kind=str(item.get("kind", "function_definition")),
+            name=str(item.get("name", "")),
+            signature=str(item.get("signature", "")),
+            start_line=int(item.get("start_line", 0) or 0),
+            end_line=int(item.get("end_line", 0) or 0),
+            doc=str(item.get("doc", "")),
+            source=str(item.get("source", "")),
+            token_tf={str(k): float(v) for k, v in dict(item.get("token_tf", {})).items()},
+            vector={str(k): float(v) for k, v in dict(item.get("vector", {})).items()},
+            norm=float(item.get("norm", 0.0) or 0.0),
+            summary=str(item.get("summary", "")),
+            summary_vector={str(k): float(v) for k, v in dict(item.get("summary_vector", {})).items()},
+            summary_norm=float(item.get("summary_norm", 0.0) or 0.0),
         )
+        functions.append(_ensure_summary_vector(record, idf))
 
     raw_lsc = payload.get("language_symbol_counts", {})
     language_symbol_counts: dict[str, dict[str, int]] = {}
@@ -300,8 +345,6 @@ def _index_from_payload(payload: dict[str, Any]) -> SemanticIndex:
     parser_errors = (
         {str(k): str(v) for k, v in raw_parser_errors.items()} if isinstance(raw_parser_errors, dict) else {}
     )
-    raw_idf = payload.get("idf", {})
-    idf = {str(k): float(v) for k, v in raw_idf.items()} if isinstance(raw_idf, dict) else {}
     raw_name_index = payload.get("function_name_index", {})
     function_name_index: dict[str, list[dict[str, Any]]] = {}
     if isinstance(raw_name_index, dict):
@@ -1153,6 +1196,12 @@ def _build_index(
         for item, tokens in zip(raw_functions, documents):
             tf = _calc_tf(tokens)
             vector = _calc_vector(tf, idf)
+            summary_vector, summary_norm = _summary_vector_for_function(
+                file_path=str(item.get("file", "")),
+                name=str(item.get("name", "")),
+                summary=str(item.get("summary", "")),
+                idf=idf,
+            )
             language_symbol_counts[item["language"]][item["kind"]] += 1
             function_records.append(
                 FunctionRecord(
@@ -1169,6 +1218,8 @@ def _build_index(
                     vector=vector,
                     norm=_calc_norm(vector),
                     summary=str(item.get("summary", "")),
+                    summary_vector=summary_vector,
+                    summary_norm=summary_norm,
                 )
             )
 

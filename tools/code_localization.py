@@ -25,6 +25,23 @@ def _score_text(query_tokens: list[str], text: str) -> tuple[float, list[str]]:
     return round(score, 4), sorted(set(overlap))[:8]
 
 
+def _query_vector(query_tokens: list[str]) -> tuple[dict[str, float], float]:
+    tf = semantic_mod._calc_tf(query_tokens)
+    return tf, semantic_mod._calc_norm(tf)
+
+
+def _coerce_vector(value: Any) -> dict[str, float]:
+    if not isinstance(value, dict):
+        return {}
+    out: dict[str, float] = {}
+    for key, raw in value.items():
+        try:
+            out[str(key)] = float(raw)
+        except Exception:
+            continue
+    return out
+
+
 def _load_existing(path: str) -> dict[str, Any]:
     payload, _, error = load_existing_hierarchical_index_any(path)
     if payload:
@@ -34,7 +51,9 @@ def _load_existing(path: str) -> dict[str, Any]:
 
 def _pick_top(nodes: list[dict[str, Any]], query_tokens: list[str], top_k: int) -> list[dict[str, Any]]:
     scored: list[dict[str, Any]] = []
+    q_vector, q_norm = _query_vector(query_tokens)
     for node in nodes:
+        kind = str(node.get("kind", ""))
         text = " ".join(
             [
                 str(node.get("name", "")),
@@ -42,18 +61,39 @@ def _pick_top(nodes: list[dict[str, Any]], query_tokens: list[str], top_k: int) 
                 str(node.get("summary", "")),
             ]
         )
-        score, overlap = _score_text(query_tokens, text)
+        lexical_score, overlap = _score_text(query_tokens, text)
+        summary_cosine = 0.0
+        ranking_mode = "lexical"
+        score = lexical_score
+        if kind == "function":
+            summary_vector = _coerce_vector(node.get("summary_vector"))
+            summary_norm = float(node.get("summary_norm", 0.0) or 0.0)
+            summary_cosine = semantic_mod._cosine_similarity(
+                q_vector,
+                q_norm,
+                summary_vector,
+                summary_norm,
+            )
+            if summary_vector and summary_norm > 0:
+                score = (0.75 * summary_cosine) + (0.25 * lexical_score)
+                ranking_mode = "summary_hybrid"
         if score <= 0:
             continue
         scored.append(
             {
                 "id": node.get("id", ""),
-                "kind": node.get("kind", ""),
+                "kind": kind,
                 "path": node.get("path", ""),
                 "name": node.get("name", ""),
                 "summary": str(node.get("summary", ""))[:240],
-                "score": score,
-                "why": f"matched tokens: {', '.join(overlap)}",
+                "score": round(score, 4),
+                "lexical_score": round(lexical_score, 4),
+                "summary_cosine": round(summary_cosine, 4),
+                "ranking_mode": ranking_mode,
+                "why": (
+                    f"summary_cosine={summary_cosine:.4f}; lexical={lexical_score:.4f}; "
+                    f"matched tokens: {', '.join(overlap)}"
+                ),
             }
         )
     scored.sort(key=lambda item: item["score"], reverse=True)
@@ -132,6 +172,7 @@ def semantic_localize_requirement(
     top_k: int = 5,
     use_llm_summary: bool = False,
     summary_model_name: str = "",
+    debug: bool = False,
 ) -> str:
     """Localize requirement across repository -> directory -> file -> function using hierarchical semantic index."""
     try:
@@ -201,6 +242,25 @@ def semantic_localize_requirement(
                     "files": top_files,
                     "functions": top_functions,
                 },
+                **(
+                    {
+                        "debug_candidates": {
+                            "functions": [
+                                {
+                                    "name": item.get("name", ""),
+                                    "path": item.get("path", ""),
+                                    "lexical_score": item.get("lexical_score", 0.0),
+                                    "summary_cosine": item.get("summary_cosine", 0.0),
+                                    "final_score": item.get("score", 0.0),
+                                    "ranking_mode": item.get("ranking_mode", ""),
+                                }
+                                for item in top_functions
+                            ]
+                        }
+                    }
+                    if bool(debug)
+                    else {}
+                ),
             },
             ensure_ascii=False,
             indent=2,
